@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""
+Offline CAN event/button scanner for TRC logs.
+
+Directory mode expects one of these layouts:
+
+  root/
+    kia/
+      1/idle.trc open.trc toggle.trc
+      17/idle.trc button.trc
+    mazda/
+      2/idle.trc open.trc toggle.trc
+
+or directly:
+
+  kia/
+    1/idle.trc open.trc toggle.trc
+    17/idle.trc button.trc
+
+Output rule format is compatible with the firmware text rules:
+  <event_id>:B:<bus>,ID:<hex>,BY:<byte>,BI:<bit>,D:<0|1>;...
+
+Default bit numbering is lsb0 because the firmware uses BIT(bit_index).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import re
+import sys
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import DefaultDict, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+HEX_ID_RE = re.compile(r"^(?:0x)?[0-9a-fA-F]{1,8}$")
+HEX_BYTE_RE = re.compile(r"^[0-9a-fA-F]{2}$")
+TIME_RE = re.compile(r"^\d+(?:[\.,]\d+)?$")
+
+RuleKey = Tuple[int, int]  # bus, can_id
+
+
+@dataclass(frozen=True)
+class Frame:
+    t: float
+    bus: int
+    can_id: int
+    dlc: int
+    data: Tuple[int, ...]
+    line_no: int
+
+
+@dataclass
+class BitInfo:
+    samples: int = 0
+    zeros: int = 0
+    ones: int = 0
+    transitions: int = 0
+    first_value: Optional[int] = None
+    last_value: Optional[int] = None
+
+    def add(self, value: int) -> None:
+        value = 1 if value else 0
+        self.samples += 1
+        if value:
+            self.ones += 1
+        else:
+            self.zeros += 1
+        if self.first_value is None:
+            self.first_value = value
+        elif self.last_value is not None and self.last_value != value:
+            self.transitions += 1
+        self.last_value = value
+
+    @property
+    def values_mask(self) -> int:
+        m = 0
+        if self.zeros:
+            m |= 1
+        if self.ones:
+            m |= 2
+        return m
+
+    def stable_value(self, min_samples: int) -> Optional[int]:
+        if self.samples < min_samples:
+            return None
+        if self.zeros and not self.ones:
+            return 0
+        if self.ones and not self.zeros:
+            return 1
+        return None
+
+    def has_value(self, value: int) -> bool:
+        return self.ones > 0 if value else self.zeros > 0
+
+
+@dataclass
+class Candidate:
+    event_id: int
+    mode: str
+    reason: str
+    bus: int
+    can_id: int
+    byte: int
+    bit_lsb0: int
+    expected: int
+    score: float
+    idle_samples: int = 0
+    open_samples: int = 0
+    action_samples: int = 0
+    action_transitions: int = 0
+    press_count: Optional[int] = None
+    overflow: bool = False
+
+    def out_bit(self, bit_order: str) -> int:
+        if bit_order == "msb0":
+            return 7 - self.bit_lsb0
+        return self.bit_lsb0
+
+    def descriptor(self, bit_order: str = "lsb0") -> str:
+        return (
+            f"B:{self.bus},ID:{self.can_id:X},BY:{self.byte},"
+            f"BI:{self.out_bit(bit_order)},D:{self.expected};"
+        )
+
+    def as_row(self, bit_order: str = "lsb0") -> Dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "mode": self.mode,
+            "reason": self.reason,
+            "bus": self.bus,
+            "id_hex": f"{self.can_id:X}",
+            "byte": self.byte,
+            "bit_lsb0": self.bit_lsb0,
+            "bit_out": self.out_bit(bit_order),
+            "expected": self.expected,
+            "score": round(self.score, 3),
+            "idle_samples": self.idle_samples,
+            "open_samples": self.open_samples,
+            "action_samples": self.action_samples,
+            "action_transitions": self.action_transitions,
+            "press_count": "" if self.press_count is None else self.press_count,
+            "overflow": self.overflow,
+            "rule": self.descriptor(bit_order),
+        }
+
+
+@dataclass
+class EventResult:
+    vehicle: str
+    event_id: int
+    mode: str
+    event_dir: str
+    rule_line: str
+    candidates: List[Candidate]
+    dropped_busy_frames: List[Dict[str, object]]
+    event_only_debug: List[Dict[str, object]]
+    warnings: List[str]
+
+
+class TrcParseError(Exception):
+    pass
+
+
+def parse_float_time(token: str) -> Optional[float]:
+    if not TIME_RE.match(token):
+        return None
+    try:
+        return float(token.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def is_hex_id(token: str) -> bool:
+    return bool(HEX_ID_RE.match(token))
+
+
+def parse_hex_id(token: str) -> int:
+    token = token.lower()
+    if token.startswith("0x"):
+        token = token[2:]
+    return int(token, 16)
+
+
+def is_hex_byte(token: str) -> bool:
+    return bool(HEX_BYTE_RE.match(token))
+
+
+def parse_int_token(token: str) -> Optional[int]:
+    try:
+        if token.lower().startswith("0x"):
+            return int(token, 16)
+        return int(token, 10)
+    except ValueError:
+        return None
+
+
+def find_frame_fields(parts: Sequence[str]) -> Optional[Tuple[int, int, int]]:
+    """Return (id_idx, dlc_idx, dlc). Works with CAN Hacker-like and many TRC-like lines."""
+    candidates: List[Tuple[int, int, int, int]] = []
+
+    # Find a DLC token followed by DLC bytes, then choose nearest previous hex token as CAN ID.
+    for dlc_idx in range(1, len(parts)):
+        dlc = parse_int_token(parts[dlc_idx])
+        if dlc is None or dlc < 0 or dlc > 64:
+            continue
+        if dlc_idx + dlc >= len(parts):
+            continue
+        byte_tokens = parts[dlc_idx + 1 : dlc_idx + 1 + dlc]
+        if len(byte_tokens) != dlc or not all(is_hex_byte(x) for x in byte_tokens):
+            continue
+
+        id_idx: Optional[int] = None
+        for j in range(dlc_idx - 1, 0, -1):
+            if is_hex_id(parts[j]):
+                # Avoid using obvious 2-byte data fields accidentally in very odd formats.
+                id_idx = j
+                break
+        if id_idx is None:
+            continue
+
+        # Score: prefer id immediately before dlc, but allow "ID Rx d DLC" variants.
+        distance = dlc_idx - id_idx
+        candidates.append((distance, id_idx, dlc_idx, dlc))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    _, id_idx, dlc_idx, dlc = candidates[0]
+    return id_idx, dlc_idx, dlc
+
+
+def infer_bus(parts: Sequence[str], id_idx: int, channel_base: int) -> int:
+    # In the user's CAN Hacker-like example:
+    #   time  channel  flags  id  dlc  data...
+    # We intentionally skip long zero-padded fields like 00000004 because those are flags.
+    for token in parts[1:id_idx]:
+        if len(token) > 2 and token.startswith("0"):
+            continue
+        v = parse_int_token(token)
+        if v is not None and 0 <= v <= 16:
+            bus = v - channel_base
+            return bus if bus >= 0 else v
+    return 0
+
+
+def parse_trc(path: Path, *, channel_base: int = 1, force_bus: Optional[int] = None, max_dlc: int = 8) -> List[Frame]:
+    frames: List[Frame] = []
+    prev_raw_t: Optional[float] = None
+    t_offset = 0.0
+
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#") or line.startswith("//") or line.startswith(";"):
+                continue
+            if line.startswith("@") or line.startswith("$"):
+                continue
+
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+
+            raw_t = parse_float_time(parts[0])
+            if raw_t is None:
+                # Some Vector TRC files may start with frame number before time. Try second token as time.
+                raw_t = parse_float_time(parts[1]) if len(parts) > 1 else None
+                if raw_t is None:
+                    continue
+
+            fields = find_frame_fields(parts)
+            if fields is None:
+                continue
+            id_idx, dlc_idx, dlc = fields
+
+            if dlc > max_dlc:
+                dlc = max_dlc
+
+            if prev_raw_t is not None and raw_t + t_offset < (prev_raw_t + t_offset) - 30.0:
+                # Logs often wrap seconds from 59.xxx to 00.xxx.
+                t_offset += 60.0
+            prev_raw_t = raw_t
+
+            try:
+                can_id = parse_hex_id(parts[id_idx])
+                data = tuple(int(x, 16) for x in parts[dlc_idx + 1 : dlc_idx + 1 + dlc])
+            except ValueError:
+                continue
+
+            bus = force_bus if force_bus is not None else infer_bus(parts, id_idx, channel_base)
+            frames.append(Frame(t=raw_t + t_offset, bus=bus, can_id=can_id, dlc=dlc, data=data, line_no=line_no))
+
+    return frames
+
+
+def group_frames(frames: Iterable[Frame]) -> Dict[RuleKey, List[Frame]]:
+    grouped: DefaultDict[RuleKey, List[Frame]] = defaultdict(list)
+    for fr in frames:
+        grouped[(fr.bus, fr.can_id)].append(fr)
+    for flist in grouped.values():
+        flist.sort(key=lambda x: x.t)
+    return dict(grouped)
+
+
+def max_len_for_key(*groups: Dict[RuleKey, List[Frame]], key: RuleKey, max_dlc: int) -> int:
+    n = 0
+    for g in groups:
+        for fr in g.get(key, []):
+            n = max(n, min(fr.dlc, max_dlc))
+    return n
+
+
+def bit_value(data: Tuple[int, ...], byte_idx: int, bit_lsb0: int) -> int:
+    if byte_idx >= len(data):
+        return 0
+    return 1 if (data[byte_idx] & (1 << bit_lsb0)) else 0
+
+
+def bit_info(frames: Sequence[Frame], byte_idx: int, bit_lsb0: int) -> BitInfo:
+    info = BitInfo()
+    for fr in frames:
+        if byte_idx >= fr.dlc:
+            continue
+        info.add(bit_value(fr.data, byte_idx, bit_lsb0))
+    return info
+
+
+def first_payloads(frames: Sequence[Frame], limit: int = 5) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for fr in frames:
+        s = " ".join(f"{b:02X}" for b in fr.data[: fr.dlc])
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def apply_busy_filter(
+    candidates: List[Candidate],
+    *,
+    max_bits_per_frame: int,
+) -> Tuple[List[Candidate], List[Dict[str, object]]]:
+    by_frame: DefaultDict[Tuple[int, int], List[Candidate]] = defaultdict(list)
+    for c in candidates:
+        by_frame[(c.bus, c.can_id)].append(c)
+
+    keep: List[Candidate] = []
+    dropped: List[Dict[str, object]] = []
+    for (bus, can_id), items in by_frame.items():
+        if max_bits_per_frame > 0 and len(items) > max_bits_per_frame:
+            dropped.append(
+                {
+                    "bus": bus,
+                    "id_hex": f"{can_id:X}",
+                    "bits": len(items),
+                    "limit": max_bits_per_frame,
+                    "reason": "busy_frame",
+                }
+            )
+        else:
+            keep.extend(items)
+    return keep, dropped
+
+
+def sort_candidates(candidates: List[Candidate]) -> List[Candidate]:
+    return sorted(candidates, key=lambda c: (-c.score, c.bus, c.can_id, c.byte, c.bit_lsb0, c.reason))
+
+
+def analyze_state_event(
+    *,
+    vehicle: str,
+    event_id: int,
+    event_dir: Path,
+    idle_path: Path,
+    open_path: Path,
+    toggle_path: Path,
+    args: argparse.Namespace,
+) -> EventResult:
+    warnings: List[str] = []
+    idle_frames = parse_trc(idle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+    open_frames = parse_trc(open_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+    toggle_frames = parse_trc(toggle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+
+    if not idle_frames:
+        warnings.append(f"idle file has no parsed frames: {idle_path}")
+    if not open_frames:
+        warnings.append(f"open file has no parsed frames: {open_path}")
+    if not toggle_frames:
+        warnings.append(f"toggle file has no parsed frames: {toggle_path}")
+
+    idle = group_frames(idle_frames)
+    opened = group_frames(open_frames)
+    toggle = group_frames(toggle_frames)
+
+    keys = set(idle) | set(opened) | set(toggle)
+    strict: List[Candidate] = []
+    fallback: List[Candidate] = []
+    event_only: List[Candidate] = []
+    debug_event_only: List[Dict[str, object]] = []
+
+    for key in sorted(keys):
+        bus, can_id = key
+        idle_list = idle.get(key, [])
+        open_list = opened.get(key, [])
+        toggle_list = toggle.get(key, [])
+        nbytes = max_len_for_key(idle, opened, toggle, key=key, max_dlc=args.max_dlc)
+        if nbytes <= 0:
+            continue
+
+        # Main strict/per-bit mode: stable in idle, stable in open, different, confirmed in toggle.
+        for by in range(nbytes):
+            for bit in range(8):
+                idle_info = bit_info(idle_list, by, bit)
+                open_info = bit_info(open_list, by, bit)
+                tog_info = bit_info(toggle_list, by, bit)
+
+                base_val = idle_info.stable_value(args.min_stable_samples)
+                open_val = open_info.stable_value(args.min_stable_samples)
+                if base_val is not None and open_val is not None and base_val != open_val:
+                    if tog_info.has_value(base_val) and tog_info.has_value(open_val) and tog_info.transitions >= args.min_state_transitions:
+                        balance = min(tog_info.zeros, tog_info.ones)
+                        score = 1000.0 + tog_info.transitions * 20.0 + balance
+                        strict.append(
+                            Candidate(
+                                event_id=event_id,
+                                mode="state",
+                                reason="idle_open_diff_confirmed_by_toggle",
+                                bus=bus,
+                                can_id=can_id,
+                                byte=by,
+                                bit_lsb0=bit,
+                                expected=open_val,
+                                score=score,
+                                idle_samples=idle_info.samples,
+                                open_samples=open_info.samples,
+                                action_samples=tog_info.samples,
+                                action_transitions=tog_info.transitions,
+                            )
+                        )
+                        continue
+
+                # Fallback: stable in idle, toggles away and back during action.
+                if base_val is not None and toggle_list:
+                    if tog_info.has_value(base_val) and tog_info.has_value(1 - base_val) and tog_info.transitions >= args.min_state_transitions:
+                        expected = open_val if open_val is not None else (1 - base_val)
+                        score = 100.0 + tog_info.transitions * 10.0 + min(tog_info.zeros, tog_info.ones)
+                        fallback.append(
+                            Candidate(
+                                event_id=event_id,
+                                mode="state",
+                                reason="fallback_idle_vs_toggle",
+                                bus=bus,
+                                can_id=can_id,
+                                byte=by,
+                                bit_lsb0=bit,
+                                expected=expected,
+                                score=score,
+                                idle_samples=idle_info.samples,
+                                open_samples=open_info.samples,
+                                action_samples=tog_info.samples,
+                                action_transitions=tog_info.transitions,
+                            )
+                        )
+
+                # Event-only: no stable idle, stable open value == 1, appears during toggle.
+                if args.include_event_only or args.event_only_if_empty:
+                    if base_val is None and open_val == 1 and tog_info.ones > 0:
+                        score = 10.0 + tog_info.ones + tog_info.transitions
+                        event_only.append(
+                            Candidate(
+                                event_id=event_id,
+                                mode="state",
+                                reason="event_only_open_snapshot",
+                                bus=bus,
+                                can_id=can_id,
+                                byte=by,
+                                bit_lsb0=bit,
+                                expected=1,
+                                score=score,
+                                idle_samples=idle_info.samples,
+                                open_samples=open_info.samples,
+                                action_samples=tog_info.samples,
+                                action_transitions=tog_info.transitions,
+                            )
+                        )
+
+        if not idle_list and (open_list or toggle_list):
+            debug_event_only.append(
+                {
+                    "bus": bus,
+                    "id_hex": f"{can_id:X}",
+                    "open_frames": len(open_list),
+                    "toggle_frames": len(toggle_list),
+                    "open_payloads": first_payloads(open_list),
+                    "toggle_payloads": first_payloads(toggle_list),
+                }
+            )
+
+    # Prefer strict candidates. Use fallback only if strict is empty.
+    selected = strict if strict else fallback
+    if not selected and (args.include_event_only or args.event_only_if_empty):
+        selected = event_only
+    elif args.include_event_only:
+        selected = selected + event_only
+
+    selected, dropped = apply_busy_filter(selected, max_bits_per_frame=args.max_bits_per_frame)
+    selected = sort_candidates(selected)[: args.max_signals_per_event]
+
+    rule_line = f"{event_id}:" + "".join(c.descriptor(args.bit_order) for c in selected)
+    if not selected:
+        rule_line = f"{event_id}:error:No changes found"
+
+    return EventResult(
+        vehicle=vehicle,
+        event_id=event_id,
+        mode="state",
+        event_dir=str(event_dir),
+        rule_line=rule_line,
+        candidates=selected,
+        dropped_busy_frames=dropped,
+        event_only_debug=debug_event_only,
+        warnings=warnings,
+    )
+
+
+def analyze_button_event(
+    *,
+    vehicle: str,
+    event_id: int,
+    event_dir: Path,
+    idle_path: Path,
+    button_path: Path,
+    args: argparse.Namespace,
+) -> EventResult:
+    warnings: List[str] = []
+    idle_frames = parse_trc(idle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+    button_frames = parse_trc(button_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+
+    if not idle_frames:
+        warnings.append(f"idle file has no parsed frames: {idle_path}")
+    if not button_frames:
+        warnings.append(f"button file has no parsed frames: {button_path}")
+
+    idle = group_frames(idle_frames)
+    pressed = group_frames(button_frames)
+    keys = set(idle) | set(pressed)
+
+    candidates: List[Candidate] = []
+    debug_event_only: List[Dict[str, object]] = []
+
+    for key in sorted(keys):
+        bus, can_id = key
+        idle_list = idle.get(key, [])
+        press_list = pressed.get(key, [])
+        nbytes = max_len_for_key(idle, pressed, key=key, max_dlc=args.max_dlc)
+        if nbytes <= 0:
+            continue
+
+        if not idle_list and press_list:
+            debug_event_only.append(
+                {
+                    "bus": bus,
+                    "id_hex": f"{can_id:X}",
+                    "button_frames": len(press_list),
+                    "button_payloads": first_payloads(press_list),
+                    "note": "ID was not present in idle; treated as debug only, not a bit rule",
+                }
+            )
+            continue
+
+        for by in range(nbytes):
+            for bit in range(8):
+                idle_info = bit_info(idle_list, by, bit)
+                base_val = idle_info.stable_value(args.min_stable_samples)
+                if base_val is None:
+                    continue
+
+                active = False
+                press_count = 0
+                overflow = False
+                active_samples = 0
+                transitions = 0
+                last_active_state: Optional[bool] = None
+
+                for fr in press_list:
+                    if by >= fr.dlc:
+                        continue
+                    val = bit_value(fr.data, by, bit)
+                    at_base = val == base_val
+                    now_active = not at_base
+                    if now_active:
+                        active_samples += 1
+
+                    if last_active_state is None:
+                        last_active_state = now_active
+                    elif last_active_state != now_active:
+                        transitions += 1
+                        last_active_state = now_active
+
+                    # Firmware-compatible state machine:
+                    # base -> not_base starts active press; not_base -> base completes one press.
+                    if not active:
+                        if not at_base:
+                            active = True
+                    else:
+                        if at_base:
+                            active = False
+                            press_count += 1
+                            if press_count > args.expected_presses:
+                                overflow = True
+                                break
+
+                confirmed = (press_count == args.expected_presses and not overflow)
+                if not confirmed and args.allow_unreleased_last_press:
+                    confirmed = (press_count == args.expected_presses - 1 and active and not overflow)
+
+                if confirmed:
+                    expected = 0 if base_val else 1
+                    score = 1000.0 + transitions * 10.0 + active_samples
+                    candidates.append(
+                        Candidate(
+                            event_id=event_id,
+                            mode="button",
+                            reason="exact_press_release_count",
+                            bus=bus,
+                            can_id=can_id,
+                            byte=by,
+                            bit_lsb0=bit,
+                            expected=expected,
+                            score=score,
+                            idle_samples=idle_info.samples,
+                            open_samples=0,
+                            action_samples=active_samples,
+                            action_transitions=transitions,
+                            press_count=press_count,
+                            overflow=overflow,
+                        )
+                    )
+
+    candidates, dropped = apply_busy_filter(candidates, max_bits_per_frame=args.button_max_bits_per_frame)
+    candidates = sort_candidates(candidates)[: args.max_signals_per_event]
+    rule_line = f"{event_id}:" + "".join(c.descriptor(args.bit_order) for c in candidates)
+    if not candidates:
+        rule_line = f"{event_id}:error:No changes found"
+
+    return EventResult(
+        vehicle=vehicle,
+        event_id=event_id,
+        mode="button",
+        event_dir=str(event_dir),
+        rule_line=rule_line,
+        candidates=candidates,
+        dropped_busy_frames=dropped,
+        event_only_debug=debug_event_only,
+        warnings=warnings,
+    )
+
+
+def file_ci(directory: Path, *names: str) -> Optional[Path]:
+    wanted = {n.lower() for n in names}
+    if not directory.is_dir():
+        return None
+    for p in directory.iterdir():
+        if p.is_file() and p.name.lower() in wanted:
+            return p
+    return None
+
+
+def discover_event_dirs(root: Path) -> List[Tuple[str, int, Path]]:
+    root = root.resolve()
+    out: List[Tuple[str, int, Path]] = []
+
+    direct_numeric = [p for p in root.iterdir() if p.is_dir() and p.name.isdigit()] if root.is_dir() else []
+    if direct_numeric:
+        for p in direct_numeric:
+            out.append((root.name, int(p.name), p))
+        return sorted(out, key=lambda x: (x[0], x[1]))
+
+    for vehicle_dir in sorted([p for p in root.iterdir() if p.is_dir()]):
+        for event_dir in sorted([p for p in vehicle_dir.iterdir() if p.is_dir() and p.name.isdigit()], key=lambda x: int(x.name)):
+            out.append((vehicle_dir.name, int(event_dir.name), event_dir))
+    return out
+
+
+def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> None:
+    vehicle_dir = out_dir / result.vehicle
+    vehicle_dir.mkdir(parents=True, exist_ok=True)
+
+    base = vehicle_dir / f"{result.event_id}_{result.mode}"
+
+    with (base.with_suffix(".csv")).open("w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "event_id",
+            "mode",
+            "reason",
+            "bus",
+            "id_hex",
+            "byte",
+            "bit_lsb0",
+            "bit_out",
+            "expected",
+            "score",
+            "idle_samples",
+            "open_samples",
+            "action_samples",
+            "action_transitions",
+            "press_count",
+            "overflow",
+            "rule",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for c in result.candidates:
+            writer.writerow(c.as_row(bit_order))
+
+    with (base.with_suffix(".json")).open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "vehicle": result.vehicle,
+                "event_id": result.event_id,
+                "mode": result.mode,
+                "event_dir": result.event_dir,
+                "rule_line": result.rule_line,
+                "candidates": [c.as_row(bit_order) for c in result.candidates],
+                "dropped_busy_frames": result.dropped_busy_frames,
+                "event_only_debug": result.event_only_debug,
+                "warnings": result.warnings,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order: str) -> None:
+    by_vehicle: DefaultDict[str, List[EventResult]] = defaultdict(list)
+    for r in results:
+        by_vehicle[r.vehicle].append(r)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for vehicle, items in by_vehicle.items():
+        vehicle_dir = out_dir / vehicle
+        vehicle_dir.mkdir(parents=True, exist_ok=True)
+        items = sorted(items, key=lambda r: r.event_id)
+
+        with (vehicle_dir / "scan_data.txt").open("w", encoding="utf-8") as f:
+            for r in items:
+                f.write(r.rule_line + "\n")
+
+        with (vehicle_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "vehicle",
+                "event_id",
+                "mode",
+                "candidate_count",
+                "dropped_busy_frames",
+                "warnings",
+                "rule_line",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in items:
+                writer.writerow(
+                    {
+                        "vehicle": r.vehicle,
+                        "event_id": r.event_id,
+                        "mode": r.mode,
+                        "candidate_count": len(r.candidates),
+                        "dropped_busy_frames": len(r.dropped_busy_frames),
+                        "warnings": " | ".join(r.warnings),
+                        "rule_line": r.rule_line,
+                    }
+                )
+
+
+def analyze_event_dir(vehicle: str, event_id: int, event_dir: Path, args: argparse.Namespace) -> Optional[EventResult]:
+    idle = file_ci(event_dir, "idle.trc")
+    opened = file_ci(event_dir, "open.trc")
+    toggle = file_ci(event_dir, "toggle.trc")
+    button = file_ci(event_dir, "button.trc")
+
+    if idle and button:
+        return analyze_button_event(
+            vehicle=vehicle,
+            event_id=event_id,
+            event_dir=event_dir,
+            idle_path=idle,
+            button_path=button,
+            args=args,
+        )
+
+    if idle and opened and toggle:
+        return analyze_state_event(
+            vehicle=vehicle,
+            event_id=event_id,
+            event_dir=event_dir,
+            idle_path=idle,
+            open_path=opened,
+            toggle_path=toggle,
+            args=args,
+        )
+
+    print(f"WARN: skip {event_dir}: expected idle+open+toggle or idle+button", file=sys.stderr)
+    return None
+
+
+def add_common_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--out", default="out_can_scan", help="Output directory")
+    p.add_argument("--bit-order", choices=["lsb0", "msb0"], default="lsb0", help="Output BI numbering. Firmware uses lsb0.")
+    p.add_argument("--trc-channel-base", type=int, default=1, help="TRC channel 1 -> firmware bus 0 by default")
+    p.add_argument("--force-bus", type=int, default=None, help="Force all parsed frames to this firmware bus index, e.g. 0 or 1")
+    p.add_argument("--max-dlc", type=int, default=8, help="Analyze first N data bytes. Firmware rules currently use 8 bytes.")
+    p.add_argument("--min-stable-samples", type=int, default=2, help="Min frames of the same ID required to call a bit stable in idle/open")
+    p.add_argument("--min-state-transitions", type=int, default=2, help="Min bit transitions in toggle.trc for state events")
+    p.add_argument("--max-bits-per-frame", type=int, default=6, help="Drop state frames with more candidate bits than this; 0 disables")
+    p.add_argument("--button-max-bits-per-frame", type=int, default=16, help="Drop button frames with more candidate bits than this; 0 disables")
+    p.add_argument("--max-signals-per-event", type=int, default=60, help="Limit output rules per event")
+    p.add_argument("--expected-presses", type=int, default=3, help="Button mode expects exactly this many complete press-release cycles")
+    p.add_argument("--allow-unreleased-last-press", action="store_true", help="Button mode: allow the recording to end while the last press is still active")
+    p.add_argument("--include-event-only", action="store_true", help="Include frames absent in idle as rules, not only debug suggestions")
+    p.add_argument("--event-only-if-empty", action="store_true", default=True, help="Use event-only candidates only if normal state detection found nothing")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Offline CAN state/button scanner for TRC recordings")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_auto = sub.add_parser("auto", help="Analyze a root directory containing vehicle/event folders")
+    p_auto.add_argument("--root", required=True, help="Root directory, e.g. kia or .")
+    add_common_args(p_auto)
+
+    p_state = sub.add_parser("state", help="Analyze one state event: idle + open + toggle")
+    p_state.add_argument("--event-id", type=int, required=True)
+    p_state.add_argument("--vehicle", default="manual")
+    p_state.add_argument("--idle", required=True)
+    p_state.add_argument("--open", required=True)
+    p_state.add_argument("--toggle", required=True)
+    add_common_args(p_state)
+
+    p_button = sub.add_parser("button", help="Analyze one button event: idle + button")
+    p_button.add_argument("--event-id", type=int, required=True)
+    p_button.add_argument("--vehicle", default="manual")
+    p_button.add_argument("--idle", required=True)
+    p_button.add_argument("--button", required=True)
+    add_common_args(p_button)
+
+    return parser
+
+
+def print_summary(results: List[EventResult]) -> None:
+    if not results:
+        print("No events analyzed")
+        return
+    print("\nSummary:")
+    print(f"{'vehicle':12} {'event':>5} {'mode':8} {'rules':>5} {'dropped':>7}  rule")
+    print("-" * 110)
+    for r in sorted(results, key=lambda x: (x.vehicle, x.event_id)):
+        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:8} {len(r.candidates):5d} {len(r.dropped_busy_frames):7d}  {r.rule_line}")
+        for w in r.warnings:
+            print(f"  WARN: {w}")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    out_dir = Path(args.out)
+    results: List[EventResult] = []
+
+    if args.cmd == "auto":
+        root = Path(args.root)
+        for vehicle, event_id, event_dir in discover_event_dirs(root):
+            result = analyze_event_dir(vehicle, event_id, event_dir, args)
+            if result is None:
+                continue
+            results.append(result)
+            write_event_outputs(result, out_dir, args.bit_order)
+
+    elif args.cmd == "state":
+        result = analyze_state_event(
+            vehicle=args.vehicle,
+            event_id=args.event_id,
+            event_dir=Path(args.idle).resolve().parent,
+            idle_path=Path(args.idle),
+            open_path=Path(args.open),
+            toggle_path=Path(args.toggle),
+            args=args,
+        )
+        results.append(result)
+        write_event_outputs(result, out_dir, args.bit_order)
+
+    elif args.cmd == "button":
+        result = analyze_button_event(
+            vehicle=args.vehicle,
+            event_id=args.event_id,
+            event_dir=Path(args.idle).resolve().parent,
+            idle_path=Path(args.idle),
+            button_path=Path(args.button),
+            args=args,
+        )
+        results.append(result)
+        write_event_outputs(result, out_dir, args.bit_order)
+
+    write_combined_outputs(results, out_dir, args.bit_order)
+    print_summary(results)
+    print(f"\nOutput written to: {out_dir.resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
