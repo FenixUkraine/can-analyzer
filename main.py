@@ -114,6 +114,10 @@ class Candidate:
     action_transitions: int = 0
     press_count: Optional[int] = None
     overflow: bool = False
+    suspect: bool = False
+    suspect_reasons: str = ""
+    suspect_score: float = 0.0
+    suspect_source: str = ""
 
     def out_bit(self, bit_order: str) -> int:
         if bit_order == "msb0":
@@ -144,6 +148,10 @@ class Candidate:
             "action_transitions": self.action_transitions,
             "press_count": "" if self.press_count is None else self.press_count,
             "overflow": self.overflow,
+            "suspect": self.suspect,
+            "suspect_reasons": self.suspect_reasons,
+            "suspect_score": round(self.suspect_score, 3),
+            "suspect_source": self.suspect_source,
             "rule": self.descriptor(bit_order),
         }
 
@@ -204,6 +212,7 @@ class EventResult:
     dropped_busy_frames: List[Dict[str, object]]
     event_only_debug: List[Dict[str, object]]
     validation_rejected: List[Dict[str, object]]
+    dynamic_suspects: List[Dict[str, object]]
     warnings: List[str]
 
 
@@ -385,6 +394,204 @@ def first_payloads(frames: Sequence[Frame], limit: int = 5) -> List[str]:
             if len(out) >= limit:
                 break
     return out
+
+
+def byte_values(frames: Sequence[Frame], byte_idx: int) -> List[int]:
+    return [fr.data[byte_idx] for fr in frames if byte_idx < fr.dlc]
+
+
+def transition_count(values: Sequence[int]) -> int:
+    if len(values) < 2:
+        return 0
+    return sum(1 for a, b in zip(values, values[1:]) if a != b)
+
+
+def sequential_counter_score(values: Sequence[int], *, mask: int, shift: int = 0) -> float:
+    """Return how often masked values increment by 1 modulo the field size.
+
+    Repeated values are ignored because some TRC logs may contain duplicated frames.
+    A high value is a strong hint of a rolling counter nibble/byte, not a proof.
+    """
+    if len(values) < 3:
+        return 0.0
+    seq = [((v >> shift) & mask) for v in values]
+    compact: List[int] = []
+    for v in seq:
+        if not compact or compact[-1] != v:
+            compact.append(v)
+    if len(compact) < 3:
+        return 0.0
+    modulo = mask + 1
+    pairs = len(compact) - 1
+    good = sum(1 for a, b in zip(compact, compact[1:]) if ((a + 1) % modulo) == b)
+    return good / pairs if pairs > 0 else 0.0
+
+
+def entropy_score(values: Sequence[int]) -> float:
+    if not values:
+        return 0.0
+    counts: DefaultDict[int, int] = defaultdict(int)
+    for v in values:
+        counts[v] += 1
+    n = len(values)
+    h = 0.0
+    for count in counts.values():
+        p = count / n
+        h -= p * math.log2(p)
+    max_h = math.log2(min(256, max(1, len(counts))))
+    return h / max_h if max_h > 0 else 0.0
+
+
+def analyze_dynamic_byte(
+    *,
+    bus: int,
+    can_id: int,
+    byte_idx: int,
+    source: str,
+    frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> Optional[Dict[str, object]]:
+    values = byte_values(frames, byte_idx)
+    samples = len(values)
+    if samples < args.dynamic_min_samples:
+        return None
+
+    unique_values = len(set(values))
+    transitions = transition_count(values)
+    transition_ratio = transitions / max(1, samples - 1)
+    entropy = entropy_score(values)
+    low_nibble_score = sequential_counter_score(values, mask=0x0F, shift=0)
+    high_nibble_score = sequential_counter_score(values, mask=0x0F, shift=4)
+    byte_counter_score = sequential_counter_score(values, mask=0xFF, shift=0)
+
+    bit_transitions: List[int] = []
+    for bit in range(8):
+        info = BitInfo()
+        for v in values:
+            info.add(1 if (v & (1 << bit)) else 0)
+        bit_transitions.append(info.transitions)
+
+    reasons: List[str] = []
+    max_counter_score = max(low_nibble_score, high_nibble_score, byte_counter_score)
+    counter_kind = ""
+    if max_counter_score >= args.counter_score_threshold:
+        if byte_counter_score == max_counter_score:
+            counter_kind = "byte_counter"
+        elif high_nibble_score == max_counter_score:
+            counter_kind = "high_nibble_counter"
+        else:
+            counter_kind = "low_nibble_counter"
+        reasons.append(counter_kind)
+
+    # This is intentionally heuristic: a real checksum is not decoded here. The goal is to mark
+    # bytes that look too dynamic/random to be a clean state bit, without dropping them.
+    if unique_values >= args.checksum_min_unique and transition_ratio >= args.checksum_transition_ratio:
+        if entropy >= args.checksum_entropy_threshold:
+            reasons.append("checksum_or_crc_suspect")
+        else:
+            reasons.append("dynamic_byte")
+    elif unique_values >= args.dynamic_byte_min_unique or transition_ratio >= args.dynamic_transition_ratio:
+        reasons.append("dynamic_byte")
+
+    if not reasons:
+        return None
+
+    return {
+        "bus": bus,
+        "id_hex": f"{can_id:X}",
+        "byte": byte_idx,
+        "source": source,
+        "samples": samples,
+        "unique_values": unique_values,
+        "transitions": transitions,
+        "transition_ratio": round(transition_ratio, 4),
+        "entropy_score": round(entropy, 4),
+        "counter_score": round(max_counter_score, 4),
+        "counter_kind": counter_kind,
+        "bit_transitions": bit_transitions,
+        "reasons": ",".join(sorted(set(reasons))),
+        "first_values_hex": " ".join(f"{v:02X}" for v in values[: min(12, len(values))]),
+    }
+
+
+def build_dynamic_suspects(
+    grouped_sources: Dict[str, Dict[RuleKey, List[Frame]]],
+    *,
+    max_dlc: int,
+    args: argparse.Namespace,
+) -> Tuple[Dict[Tuple[int, int, int], Dict[str, object]], List[Dict[str, object]]]:
+    """Detect rolling-counter/checksum/dynamic-looking bytes.
+
+    The returned profile is keyed by (bus, can_id, byte). It is used only to annotate candidates.
+    It does not reject candidates, because those frames may still contain useful state bits.
+    """
+    per_candidate_byte: Dict[Tuple[int, int, int], Dict[str, object]] = {}
+    rows: List[Dict[str, object]] = []
+    all_keys = set()
+    for source_group in grouped_sources.values():
+        all_keys |= set(source_group.keys())
+
+    for key in sorted(all_keys):
+        bus, can_id = key
+        combined_frames: List[Frame] = []
+        nbytes = 0
+        for source_group in grouped_sources.values():
+            frames = source_group.get(key, [])
+            combined_frames.extend(frames)
+            for fr in frames:
+                nbytes = max(nbytes, min(fr.dlc, max_dlc))
+        if nbytes <= 0:
+            continue
+
+        sources_to_check: List[Tuple[str, Sequence[Frame]]] = [("all", sorted(combined_frames, key=lambda x: x.t))]
+        for source_name, source_group in grouped_sources.items():
+            source_frames = source_group.get(key, [])
+            if source_frames:
+                sources_to_check.append((source_name, source_frames))
+
+        for by in range(nbytes):
+            profiles: List[Dict[str, object]] = []
+            for source_name, frames in sources_to_check:
+                profile = analyze_dynamic_byte(bus=bus, can_id=can_id, byte_idx=by, source=source_name, frames=frames, args=args)
+                if profile is not None:
+                    profiles.append(profile)
+
+            if not profiles:
+                continue
+
+            # Prefer idle/button-local evidence when present; otherwise use the strongest combined signal.
+            def rank_profile(row: Dict[str, object]) -> Tuple[int, float, float, int]:
+                source = str(row.get("source", ""))
+                source_priority = {"idle": 4, "button": 3, "open": 2, "toggle": 2, "all": 1}.get(source, 0)
+                return (
+                    source_priority,
+                    float(row.get("counter_score", 0.0)),
+                    float(row.get("transition_ratio", 0.0)),
+                    int(row.get("unique_values", 0)),
+                )
+
+            best = max(profiles, key=rank_profile)
+            per_candidate_byte[(bus, can_id, by)] = best
+            rows.extend(profiles)
+
+    rows.sort(key=lambda r: (r["bus"], str(r["id_hex"]), int(r["byte"]), str(r["source"])))
+    return per_candidate_byte, rows[: args.max_dynamic_suspects]
+
+
+def annotate_candidates_with_dynamic_suspects(
+    candidates: List[Candidate],
+    dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
+) -> None:
+    for c in candidates:
+        row = dynamic_by_byte.get((c.bus, c.can_id, c.byte))
+        if row is None:
+            continue
+        c.suspect = True
+        c.suspect_reasons = str(row.get("reasons", ""))
+        c.suspect_score = max(float(row.get("counter_score", 0.0)), float(row.get("transition_ratio", 0.0)))
+        c.suspect_source = str(row.get("source", ""))
+        if c.suspect_reasons and c.suspect_reasons not in c.reason:
+            c.reason = f"{c.reason}|suspect:{c.suspect_reasons}"
 
 
 def apply_busy_filter(
@@ -638,6 +845,11 @@ def analyze_state_event(
     idle = group_frames(idle_frames)
     opened = group_frames(open_frames)
     toggle = group_frames(toggle_frames)
+    dynamic_by_byte, dynamic_suspects = build_dynamic_suspects(
+        {"idle": idle, "open": opened, "toggle": toggle},
+        max_dlc=args.max_dlc,
+        args=args,
+    )
 
     keys = set(idle) | set(opened) | set(toggle)
     strict: List[Candidate] = []
@@ -750,6 +962,7 @@ def analyze_state_event(
     elif args.include_event_only:
         selected = selected + event_only
 
+    annotate_candidates_with_dynamic_suspects(selected, dynamic_by_byte)
     selected, validation_rejected = validate_state_candidates(
         selected,
         idle=idle,
@@ -774,6 +987,7 @@ def analyze_state_event(
         dropped_busy_frames=dropped,
         event_only_debug=debug_event_only,
         validation_rejected=validation_rejected,
+        dynamic_suspects=dynamic_suspects,
         warnings=warnings,
     )
 
@@ -798,6 +1012,11 @@ def analyze_button_event(
 
     idle = group_frames(idle_frames)
     pressed = group_frames(button_frames)
+    dynamic_by_byte, dynamic_suspects = build_dynamic_suspects(
+        {"idle": idle, "button": pressed},
+        max_dlc=args.max_dlc,
+        args=args,
+    )
     keys = set(idle) | set(pressed)
 
     candidates: List[Candidate] = []
@@ -857,6 +1076,7 @@ def analyze_button_event(
                     probe.overflow = button_stats.active_segments > args.expected_presses
                     candidates.append(probe)
 
+    annotate_candidates_with_dynamic_suspects(candidates, dynamic_by_byte)
     candidates, validation_rejected = validate_button_candidates(
         candidates,
         idle=idle,
@@ -879,6 +1099,7 @@ def analyze_button_event(
         dropped_busy_frames=dropped,
         event_only_debug=debug_event_only,
         validation_rejected=validation_rejected,
+        dynamic_suspects=dynamic_suspects,
         warnings=warnings,
     )
 
@@ -933,6 +1154,10 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
             "action_transitions",
             "press_count",
             "overflow",
+            "suspect",
+            "suspect_reasons",
+            "suspect_score",
+            "suspect_source",
             "rule",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -952,6 +1177,7 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
                 "dropped_busy_frames": result.dropped_busy_frames,
                 "event_only_debug": result.event_only_debug,
                 "validation_rejected": result.validation_rejected,
+                "dynamic_suspects": result.dynamic_suspects,
                 "warnings": result.warnings,
             },
             f,
@@ -981,6 +1207,8 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                 "event_id",
                 "mode",
                 "candidate_count",
+                "suspect_candidates",
+                "dynamic_suspects",
                 "dropped_busy_frames",
                 "validation_rejected",
                 "warnings",
@@ -995,12 +1223,41 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                         "event_id": r.event_id,
                         "mode": r.mode,
                         "candidate_count": len(r.candidates),
+                        "suspect_candidates": sum(1 for c in r.candidates if c.suspect),
+                        "dynamic_suspects": len(r.dynamic_suspects),
                         "dropped_busy_frames": len(r.dropped_busy_frames),
                         "validation_rejected": len(r.validation_rejected),
                         "warnings": " | ".join(r.warnings),
                         "rule_line": r.rule_line,
                     }
                 )
+
+        with (vehicle_dir / "dynamic_suspects.csv").open("w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "event_id",
+                "mode",
+                "bus",
+                "id_hex",
+                "byte",
+                "source",
+                "samples",
+                "unique_values",
+                "transitions",
+                "transition_ratio",
+                "entropy_score",
+                "counter_score",
+                "counter_kind",
+                "reasons",
+                "first_values_hex",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for r in items:
+                for row in r.dynamic_suspects:
+                    out_row = dict(row)
+                    out_row["event_id"] = r.event_id
+                    out_row["mode"] = r.mode
+                    writer.writerow(out_row)
 
 
 def analyze_event_dir(vehicle: str, event_id: int, event_dir: Path, args: argparse.Namespace) -> Optional[EventResult]:
@@ -1047,6 +1304,14 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-open-active-ratio", type=float, default=1.0, help="State mode: required active ratio in open.trc; 1.0 means every sample must be active")
     p.add_argument("--allow-missing-idle-as-inactive", action="store_true", help="Treat a candidate missing from idle.trc as inactive instead of rejecting it")
     p.add_argument("--max-validation-rejected", type=int, default=200, help="Max rejected candidates to store in per-event JSON")
+    p.add_argument("--dynamic-min-samples", type=int, default=8, help="Min byte samples before marking counter/checksum/dynamic suspects")
+    p.add_argument("--dynamic-byte-min-unique", type=int, default=8, help="Mark byte dynamic if it has at least this many unique values")
+    p.add_argument("--dynamic-transition-ratio", type=float, default=0.70, help="Mark byte dynamic if byte value changes this often between consecutive frames")
+    p.add_argument("--counter-score-threshold", type=float, default=0.70, help="Mark byte/nibble as counter-like if sequential increment score reaches this")
+    p.add_argument("--checksum-min-unique", type=int, default=12, help="Checksum/CRC suspect: min unique byte values")
+    p.add_argument("--checksum-transition-ratio", type=float, default=0.80, help="Checksum/CRC suspect: min byte transition ratio")
+    p.add_argument("--checksum-entropy-threshold", type=float, default=0.70, help="Checksum/CRC suspect: normalized entropy threshold")
+    p.add_argument("--max-dynamic-suspects", type=int, default=300, help="Max dynamic byte suspect rows to store per event JSON and combined CSV")
     p.add_argument("--max-bits-per-frame", type=int, default=6, help="Drop state frames with more candidate bits than this; 0 disables")
     p.add_argument("--button-max-bits-per-frame", type=int, default=16, help="Drop button frames with more candidate bits than this; 0 disables")
     p.add_argument("--max-signals-per-event", type=int, default=60, help="Limit output rules per event")
@@ -1087,10 +1352,10 @@ def print_summary(results: List[EventResult]) -> None:
         print("No events analyzed")
         return
     print("\nSummary:")
-    print(f"{'vehicle':12} {'event':>5} {'mode':8} {'rules':>5} {'dropped':>7} {'reject':>7}  rule")
+    print(f"{'vehicle':12} {'event':>5} {'mode':8} {'rules':>5} {'susp':>5} {'dyn':>5} {'dropped':>7} {'reject':>7}  rule")
     print("-" * 122)
     for r in sorted(results, key=lambda x: (x.vehicle, x.event_id)):
-        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:8} {len(r.candidates):5d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
+        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:8} {len(r.candidates):5d} {sum(1 for c in r.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
         for w in r.warnings:
             print(f"  WARN: {w}")
 
