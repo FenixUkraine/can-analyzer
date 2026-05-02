@@ -1,0 +1,4 @@
+event_id,mode,reason,bus,id_hex,byte,bit_lsb0,bit_out,expected,score,idle_samples,open_samples,action_samples,action_transitions,press_count,overflow,rule
+33,button,exact_press_release_count,0,240,0,3,3,1,1387.0,1445,0,337,5,3,False,"B:0,ID:240,BY:0,BI:3,D:1;"
+33,button,exact_press_release_count,0,9D,0,0,0,1,1074.0,174,0,14,6,3,False,"B:0,ID:9D,BY:0,BI:0,D:1;"
+33,button,exact_press_release_count,0,9D,2,1,1,0,1074.0,174,0,14,6,3,False,"B:0,ID:9D,BY:2,BI:1,D:0;"

@@ -1,0 +1,1 @@
+python main.py auto --root kia --out out_can_scan --min-state-transitions 2

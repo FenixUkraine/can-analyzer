@@ -1,0 +1,31 @@
+{
+  "vehicle": "mazda",
+  "event_id": 40,
+  "mode": "button",
+  "event_dir": "D:\\fenix\\python\\analyzer\\mazda\\40",
+  "rule_line": "40:B:0,ID:9E,BY:6,BI:1,D:0;",
+  "candidates": [
+    {
+      "event_id": 40,
+      "mode": "button",
+      "reason": "exact_press_release_count",
+      "bus": 0,
+      "id_hex": "9E",
+      "byte": 6,
+      "bit_lsb0": 1,
+      "bit_out": 1,
+      "expected": 0,
+      "score": 1065.0,
+      "idle_samples": 174,
+      "open_samples": 0,
+      "action_samples": 5,
+      "action_transitions": 6,
+      "press_count": 3,
+      "overflow": false,
+      "rule": "B:0,ID:9E,BY:6,BI:1,D:0;"
+    }
+  ],
+  "dropped_busy_frames": [],
+  "event_only_debug": [],
+  "warnings": []
+}

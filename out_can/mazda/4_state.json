@@ -1,0 +1,31 @@
+{
+  "vehicle": "mazda",
+  "event_id": 4,
+  "mode": "state",
+  "event_dir": "D:\\fenix\\python\\analyzer\\mazda\\4",
+  "rule_line": "4:B:0,ID:43E,BY:4,BI:2,D:1;",
+  "candidates": [
+    {
+      "event_id": 4,
+      "mode": "state",
+      "reason": "idle_open_diff_confirmed_by_toggle",
+      "bus": 0,
+      "id_hex": "43E",
+      "byte": 4,
+      "bit_lsb0": 2,
+      "bit_out": 2,
+      "expected": 1,
+      "score": 1193.0,
+      "idle_samples": 48,
+      "open_samples": 30,
+      "action_samples": 30,
+      "action_transitions": 9,
+      "press_count": "",
+      "overflow": false,
+      "rule": "B:0,ID:43E,BY:4,BI:2,D:1;"
+    }
+  ],
+  "dropped_busy_frames": [],
+  "event_only_debug": [],
+  "warnings": []
+}

@@ -1,0 +1,31 @@
+{
+  "vehicle": "kia",
+  "event_id": 6,
+  "mode": "state",
+  "event_dir": "D:\\fenix\\python\\analyzer\\kia\\6",
+  "rule_line": "6:B:0,ID:541,BY:1,BI:4,D:1;",
+  "candidates": [
+    {
+      "event_id": 6,
+      "mode": "state",
+      "reason": "idle_open_diff_confirmed_by_toggle",
+      "bus": 0,
+      "id_hex": "541",
+      "byte": 1,
+      "bit_lsb0": 4,
+      "bit_out": 4,
+      "expected": 1,
+      "score": 1101.0,
+      "idle_samples": 32,
+      "open_samples": 116,
+      "action_samples": 250,
+      "action_transitions": 2,
+      "press_count": "",
+      "overflow": false,
+      "rule": "B:0,ID:541,BY:1,BI:4,D:1;"
+    }
+  ],
+  "dropped_busy_frames": [],
+  "event_only_debug": [],
+  "warnings": []
+}

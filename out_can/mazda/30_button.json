@@ -1,0 +1,50 @@
+{
+  "vehicle": "mazda",
+  "event_id": 30,
+  "mode": "button",
+  "event_dir": "D:\\fenix\\python\\analyzer\\mazda\\30",
+  "rule_line": "30:B:0,ID:420,BY:0,BI:0,D:1;B:0,ID:420,BY:0,BI:1,D:0;",
+  "candidates": [
+    {
+      "event_id": 30,
+      "mode": "button",
+      "reason": "exact_press_release_count",
+      "bus": 0,
+      "id_hex": "420",
+      "byte": 0,
+      "bit_lsb0": 0,
+      "bit_out": 0,
+      "expected": 1,
+      "score": 1148.0,
+      "idle_samples": 174,
+      "open_samples": 0,
+      "action_samples": 88,
+      "action_transitions": 6,
+      "press_count": 3,
+      "overflow": false,
+      "rule": "B:0,ID:420,BY:0,BI:0,D:1;"
+    },
+    {
+      "event_id": 30,
+      "mode": "button",
+      "reason": "exact_press_release_count",
+      "bus": 0,
+      "id_hex": "420",
+      "byte": 0,
+      "bit_lsb0": 1,
+      "bit_out": 1,
+      "expected": 0,
+      "score": 1148.0,
+      "idle_samples": 174,
+      "open_samples": 0,
+      "action_samples": 88,
+      "action_transitions": 6,
+      "press_count": 3,
+      "overflow": false,
+      "rule": "B:0,ID:420,BY:0,BI:1,D:0;"
+    }
+  ],
+  "dropped_busy_frames": [],
+  "event_only_debug": [],
+  "warnings": []
+}

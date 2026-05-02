@@ -1,0 +1,8 @@
+event_id,mode,reason,bus,id_hex,byte,bit_lsb0,bit_out,expected,score,idle_samples,open_samples,action_samples,action_transitions,press_count,overflow,rule
+20,state,idle_open_diff_confirmed_by_toggle,0,9A,0,4,4,0,1131.0,174,169,162,5,,False,"B:0,ID:9A,BY:0,BI:4,D:0;"
+20,state,idle_open_diff_confirmed_by_toggle,0,9A,0,5,5,0,1131.0,174,169,162,5,,False,"B:0,ID:9A,BY:0,BI:5,D:0;"
+20,state,idle_open_diff_confirmed_by_toggle,0,9A,2,1,1,0,1131.0,174,169,162,5,,False,"B:0,ID:9A,BY:2,BI:1,D:0;"
+20,state,idle_open_diff_confirmed_by_toggle,0,9A,6,2,2,0,1131.0,174,169,162,5,,False,"B:0,ID:9A,BY:6,BI:2,D:0;"
+20,state,idle_open_diff_confirmed_by_toggle,0,9A,7,4,4,0,1131.0,174,169,162,5,,False,"B:0,ID:9A,BY:7,BI:4,D:0;"
+20,state,idle_open_diff_confirmed_by_toggle,0,43E,3,6,6,0,1124.0,35,34,48,5,,False,"B:0,ID:43E,BY:3,BI:6,D:0;"
+20,state,idle_open_diff_confirmed_by_toggle,0,9F,0,3,3,0,1116.0,87,84,76,5,,False,"B:0,ID:9F,BY:0,BI:3,D:0;"

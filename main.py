@@ -149,6 +149,51 @@ class Candidate:
 
 
 @dataclass
+class ActivityStats:
+    samples: int = 0
+    active_samples: int = 0
+    inactive_samples: int = 0
+    transitions: int = 0
+    active_segments: int = 0
+    first_active: Optional[bool] = None
+    last_active: Optional[bool] = None
+
+    def add(self, active: bool) -> None:
+        active = bool(active)
+        self.samples += 1
+        if active:
+            self.active_samples += 1
+        else:
+            self.inactive_samples += 1
+
+        if self.first_active is None:
+            self.first_active = active
+            if active:
+                self.active_segments = 1
+        elif self.last_active is not None and self.last_active != active:
+            self.transitions += 1
+            if active:
+                self.active_segments += 1
+        self.last_active = active
+
+    @property
+    def active_ratio(self) -> float:
+        if self.samples <= 0:
+            return 0.0
+        return self.active_samples / self.samples
+
+    def as_dict(self, prefix: str) -> Dict[str, object]:
+        return {
+            f"{prefix}_samples": self.samples,
+            f"{prefix}_active_samples": self.active_samples,
+            f"{prefix}_inactive_samples": self.inactive_samples,
+            f"{prefix}_transitions": self.transitions,
+            f"{prefix}_active_segments": self.active_segments,
+            f"{prefix}_active_ratio": round(self.active_ratio, 4),
+        }
+
+
+@dataclass
 class EventResult:
     vehicle: str
     event_id: int
@@ -158,6 +203,7 @@ class EventResult:
     candidates: List[Candidate]
     dropped_busy_frames: List[Dict[str, object]]
     event_only_debug: List[Dict[str, object]]
+    validation_rejected: List[Dict[str, object]]
     warnings: List[str]
 
 
@@ -372,6 +418,201 @@ def sort_candidates(candidates: List[Candidate]) -> List[Candidate]:
     return sorted(candidates, key=lambda c: (-c.score, c.bus, c.can_id, c.byte, c.bit_lsb0, c.reason))
 
 
+def candidate_key(candidate: Candidate) -> RuleKey:
+    return candidate.bus, candidate.can_id
+
+
+def candidate_activity_stats(frames: Sequence[Frame], candidate: Candidate) -> ActivityStats:
+    """Count how often a candidate bit is in its active state.
+
+    candidate.expected is treated as the active value:
+      - state: value that must be present in open.trc
+      - button: value that must be present while the button is pressed
+    """
+    stats = ActivityStats()
+    for fr in frames:
+        if candidate.byte >= fr.dlc:
+            continue
+        active = bit_value(fr.data, candidate.byte, candidate.bit_lsb0) == candidate.expected
+        stats.add(active)
+    return stats
+
+
+def validation_reject_row(
+    candidate: Candidate,
+    *,
+    reason: str,
+    bit_order: str,
+    idle_stats: Optional[ActivityStats] = None,
+    open_stats: Optional[ActivityStats] = None,
+    action_stats: Optional[ActivityStats] = None,
+) -> Dict[str, object]:
+    row = candidate.as_row(bit_order)
+    row["validation"] = "rejected"
+    row["validation_reason"] = reason
+    if idle_stats is not None:
+        row.update(idle_stats.as_dict("idle"))
+    if open_stats is not None:
+        row.update(open_stats.as_dict("open"))
+    if action_stats is not None:
+        row.update(action_stats.as_dict("action"))
+    return row
+
+
+def validate_state_candidate(
+    candidate: Candidate,
+    *,
+    idle_frames: Sequence[Frame],
+    open_frames: Sequence[Frame],
+    toggle_frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> Tuple[bool, Optional[str], ActivityStats, ActivityStats, ActivityStats]:
+    idle_stats = candidate_activity_stats(idle_frames, candidate)
+    open_stats = candidate_activity_stats(open_frames, candidate)
+    toggle_stats = candidate_activity_stats(toggle_frames, candidate)
+
+    # ID/bit must be inactive in idle.trc. By default "missing in idle" is not accepted,
+    # because it is unknown, not a confirmed inactive state. It can be enabled explicitly.
+    if idle_stats.samples < args.min_stable_samples:
+        if not (args.allow_missing_idle_as_inactive and idle_stats.samples == 0):
+            return False, "idle_missing_or_too_few_samples", idle_stats, open_stats, toggle_stats
+    if idle_stats.active_samples > args.max_idle_active_samples:
+        return False, "idle_is_active", idle_stats, open_stats, toggle_stats
+
+    # ID/bit must be active in open.trc.
+    if open_stats.samples < args.min_stable_samples:
+        return False, "open_missing_or_too_few_samples", idle_stats, open_stats, toggle_stats
+    if open_stats.active_ratio < args.min_open_active_ratio:
+        return False, "open_not_active_enough", idle_stats, open_stats, toggle_stats
+
+    # In toggle.trc it must really switch: there must be both active and inactive samples,
+    # at least one active segment, and enough active/inactive transitions.
+    if toggle_stats.samples < args.min_stable_samples:
+        return False, "toggle_missing_or_too_few_samples", idle_stats, open_stats, toggle_stats
+    if toggle_stats.active_samples <= 0:
+        return False, "toggle_never_active", idle_stats, open_stats, toggle_stats
+    if toggle_stats.inactive_samples <= 0:
+        return False, "toggle_never_inactive", idle_stats, open_stats, toggle_stats
+    if toggle_stats.transitions < args.min_state_transitions:
+        return False, "toggle_not_switching", idle_stats, open_stats, toggle_stats
+    if toggle_stats.active_segments < args.min_toggle_activations:
+        return False, "toggle_too_few_active_segments", idle_stats, open_stats, toggle_stats
+
+    return True, None, idle_stats, open_stats, toggle_stats
+
+
+def validate_state_candidates(
+    candidates: List[Candidate],
+    *,
+    idle: Dict[RuleKey, List[Frame]],
+    opened: Dict[RuleKey, List[Frame]],
+    toggle: Dict[RuleKey, List[Frame]],
+    args: argparse.Namespace,
+) -> Tuple[List[Candidate], List[Dict[str, object]]]:
+    valid: List[Candidate] = []
+    rejected: List[Dict[str, object]] = []
+
+    for c in candidates:
+        key = candidate_key(c)
+        ok, reason, idle_stats, open_stats, toggle_stats = validate_state_candidate(
+            c,
+            idle_frames=idle.get(key, []),
+            open_frames=opened.get(key, []),
+            toggle_frames=toggle.get(key, []),
+            args=args,
+        )
+        if ok:
+            c.idle_samples = idle_stats.samples
+            c.open_samples = open_stats.samples
+            c.action_samples = toggle_stats.samples
+            c.action_transitions = toggle_stats.transitions
+            c.press_count = toggle_stats.active_segments
+            valid.append(c)
+        else:
+            rejected.append(
+                validation_reject_row(
+                    c,
+                    reason=reason or "unknown",
+                    bit_order=args.bit_order,
+                    idle_stats=idle_stats,
+                    open_stats=open_stats,
+                    action_stats=toggle_stats,
+                )
+            )
+
+    return valid, rejected[: args.max_validation_rejected]
+
+
+def validate_button_candidate(
+    candidate: Candidate,
+    *,
+    idle_frames: Sequence[Frame],
+    button_frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> Tuple[bool, Optional[str], ActivityStats, ActivityStats]:
+    idle_stats = candidate_activity_stats(idle_frames, candidate)
+    button_stats = candidate_activity_stats(button_frames, candidate)
+
+    # Candidate must be inactive in idle.trc.
+    if idle_stats.samples < args.min_stable_samples:
+        if not (args.allow_missing_idle_as_inactive and idle_stats.samples == 0):
+            return False, "idle_missing_or_too_few_samples", idle_stats, button_stats
+    if idle_stats.active_samples > args.max_idle_active_samples:
+        return False, "idle_is_active", idle_stats, button_stats
+
+    # Button mode is intentionally strict: exactly N active segments == exactly N presses.
+    # This is stricter and more useful than only checking that the bit changed.
+    if button_stats.samples < args.min_stable_samples:
+        return False, "button_missing_or_too_few_samples", idle_stats, button_stats
+    if button_stats.active_segments != args.expected_presses:
+        return False, "button_press_count_not_exact", idle_stats, button_stats
+    if button_stats.active_samples < args.expected_presses:
+        return False, "button_too_few_active_samples", idle_stats, button_stats
+    if button_stats.inactive_samples <= 0 and not args.allow_unreleased_last_press:
+        return False, "button_never_returns_inactive", idle_stats, button_stats
+
+    return True, None, idle_stats, button_stats
+
+
+def validate_button_candidates(
+    candidates: List[Candidate],
+    *,
+    idle: Dict[RuleKey, List[Frame]],
+    pressed: Dict[RuleKey, List[Frame]],
+    args: argparse.Namespace,
+) -> Tuple[List[Candidate], List[Dict[str, object]]]:
+    valid: List[Candidate] = []
+    rejected: List[Dict[str, object]] = []
+
+    for c in candidates:
+        key = candidate_key(c)
+        ok, reason, idle_stats, button_stats = validate_button_candidate(
+            c,
+            idle_frames=idle.get(key, []),
+            button_frames=pressed.get(key, []),
+            args=args,
+        )
+        if ok:
+            c.idle_samples = idle_stats.samples
+            c.action_samples = button_stats.active_samples
+            c.action_transitions = button_stats.transitions
+            c.press_count = button_stats.active_segments
+            c.overflow = button_stats.active_segments > args.expected_presses
+            valid.append(c)
+        else:
+            rejected.append(
+                validation_reject_row(
+                    c,
+                    reason=reason or "unknown",
+                    bit_order=args.bit_order,
+                    idle_stats=idle_stats,
+                    action_stats=button_stats,
+                )
+            )
+
+    return valid, rejected[: args.max_validation_rejected]
+
+
 def analyze_state_event(
     *,
     vehicle: str,
@@ -509,6 +750,13 @@ def analyze_state_event(
     elif args.include_event_only:
         selected = selected + event_only
 
+    selected, validation_rejected = validate_state_candidates(
+        selected,
+        idle=idle,
+        opened=opened,
+        toggle=toggle,
+        args=args,
+    )
     selected, dropped = apply_busy_filter(selected, max_bits_per_frame=args.max_bits_per_frame)
     selected = sort_candidates(selected)[: args.max_signals_per_event]
 
@@ -525,6 +773,7 @@ def analyze_state_event(
         candidates=selected,
         dropped_busy_frames=dropped,
         event_only_debug=debug_event_only,
+        validation_rejected=validation_rejected,
         warnings=warnings,
     )
 
@@ -581,68 +830,39 @@ def analyze_button_event(
                 if base_val is None:
                     continue
 
-                active = False
-                press_count = 0
-                overflow = False
-                active_samples = 0
-                transitions = 0
-                last_active_state: Optional[bool] = None
+                expected = 0 if base_val else 1
+                probe = Candidate(
+                    event_id=event_id,
+                    mode="button",
+                    reason="button_activity_probe",
+                    bus=bus,
+                    can_id=can_id,
+                    byte=by,
+                    bit_lsb0=bit,
+                    expected=expected,
+                    score=0.0,
+                    idle_samples=idle_info.samples,
+                    open_samples=0,
+                )
+                button_stats = candidate_activity_stats(press_list, probe)
 
-                for fr in press_list:
-                    if by >= fr.dlc:
-                        continue
-                    val = bit_value(fr.data, by, bit)
-                    at_base = val == base_val
-                    now_active = not at_base
-                    if now_active:
-                        active_samples += 1
+                # Keep every bit that becomes active at least once, then the validator below
+                # will accept only bits with exactly args.expected_presses active segments.
+                if button_stats.active_segments > 0:
+                    probe.reason = "button_activity_checked_by_validator"
+                    probe.score = 1000.0 + button_stats.active_segments * 100.0 + button_stats.transitions * 10.0 + button_stats.active_samples
+                    probe.action_samples = button_stats.active_samples
+                    probe.action_transitions = button_stats.transitions
+                    probe.press_count = button_stats.active_segments
+                    probe.overflow = button_stats.active_segments > args.expected_presses
+                    candidates.append(probe)
 
-                    if last_active_state is None:
-                        last_active_state = now_active
-                    elif last_active_state != now_active:
-                        transitions += 1
-                        last_active_state = now_active
-
-                    # Firmware-compatible state machine:
-                    # base -> not_base starts active press; not_base -> base completes one press.
-                    if not active:
-                        if not at_base:
-                            active = True
-                    else:
-                        if at_base:
-                            active = False
-                            press_count += 1
-                            if press_count > args.expected_presses:
-                                overflow = True
-                                break
-
-                confirmed = (press_count == args.expected_presses and not overflow)
-                if not confirmed and args.allow_unreleased_last_press:
-                    confirmed = (press_count == args.expected_presses - 1 and active and not overflow)
-
-                if confirmed:
-                    expected = 0 if base_val else 1
-                    score = 1000.0 + transitions * 10.0 + active_samples
-                    candidates.append(
-                        Candidate(
-                            event_id=event_id,
-                            mode="button",
-                            reason="exact_press_release_count",
-                            bus=bus,
-                            can_id=can_id,
-                            byte=by,
-                            bit_lsb0=bit,
-                            expected=expected,
-                            score=score,
-                            idle_samples=idle_info.samples,
-                            open_samples=0,
-                            action_samples=active_samples,
-                            action_transitions=transitions,
-                            press_count=press_count,
-                            overflow=overflow,
-                        )
-                    )
-
+    candidates, validation_rejected = validate_button_candidates(
+        candidates,
+        idle=idle,
+        pressed=pressed,
+        args=args,
+    )
     candidates, dropped = apply_busy_filter(candidates, max_bits_per_frame=args.button_max_bits_per_frame)
     candidates = sort_candidates(candidates)[: args.max_signals_per_event]
     rule_line = f"{event_id}:" + "".join(c.descriptor(args.bit_order) for c in candidates)
@@ -658,6 +878,7 @@ def analyze_button_event(
         candidates=candidates,
         dropped_busy_frames=dropped,
         event_only_debug=debug_event_only,
+        validation_rejected=validation_rejected,
         warnings=warnings,
     )
 
@@ -730,6 +951,7 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
                 "candidates": [c.as_row(bit_order) for c in result.candidates],
                 "dropped_busy_frames": result.dropped_busy_frames,
                 "event_only_debug": result.event_only_debug,
+                "validation_rejected": result.validation_rejected,
                 "warnings": result.warnings,
             },
             f,
@@ -760,6 +982,7 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                 "mode",
                 "candidate_count",
                 "dropped_busy_frames",
+                "validation_rejected",
                 "warnings",
                 "rule_line",
             ]
@@ -773,6 +996,7 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                         "mode": r.mode,
                         "candidate_count": len(r.candidates),
                         "dropped_busy_frames": len(r.dropped_busy_frames),
+                        "validation_rejected": len(r.validation_rejected),
                         "warnings": " | ".join(r.warnings),
                         "rule_line": r.rule_line,
                     }
@@ -817,7 +1041,12 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--force-bus", type=int, default=None, help="Force all parsed frames to this firmware bus index, e.g. 0 or 1")
     p.add_argument("--max-dlc", type=int, default=8, help="Analyze first N data bytes. Firmware rules currently use 8 bytes.")
     p.add_argument("--min-stable-samples", type=int, default=2, help="Min frames of the same ID required to call a bit stable in idle/open")
-    p.add_argument("--min-state-transitions", type=int, default=2, help="Min bit transitions in toggle.trc for state events")
+    p.add_argument("--min-state-transitions", type=int, default=1, help="Min active/inactive transitions in toggle.trc for state events")
+    p.add_argument("--min-toggle-activations", type=int, default=1, help="State mode: min active segments in toggle.trc")
+    p.add_argument("--max-idle-active-samples", type=int, default=0, help="Reject a candidate if idle.trc has more active samples than this")
+    p.add_argument("--min-open-active-ratio", type=float, default=1.0, help="State mode: required active ratio in open.trc; 1.0 means every sample must be active")
+    p.add_argument("--allow-missing-idle-as-inactive", action="store_true", help="Treat a candidate missing from idle.trc as inactive instead of rejecting it")
+    p.add_argument("--max-validation-rejected", type=int, default=200, help="Max rejected candidates to store in per-event JSON")
     p.add_argument("--max-bits-per-frame", type=int, default=6, help="Drop state frames with more candidate bits than this; 0 disables")
     p.add_argument("--button-max-bits-per-frame", type=int, default=16, help="Drop button frames with more candidate bits than this; 0 disables")
     p.add_argument("--max-signals-per-event", type=int, default=60, help="Limit output rules per event")
@@ -858,10 +1087,10 @@ def print_summary(results: List[EventResult]) -> None:
         print("No events analyzed")
         return
     print("\nSummary:")
-    print(f"{'vehicle':12} {'event':>5} {'mode':8} {'rules':>5} {'dropped':>7}  rule")
-    print("-" * 110)
+    print(f"{'vehicle':12} {'event':>5} {'mode':8} {'rules':>5} {'dropped':>7} {'reject':>7}  rule")
+    print("-" * 122)
     for r in sorted(results, key=lambda x: (x.vehicle, x.event_id)):
-        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:8} {len(r.candidates):5d} {len(r.dropped_busy_frames):7d}  {r.rule_line}")
+        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:8} {len(r.candidates):5d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
         for w in r.warnings:
             print(f"  WARN: {w}")
 

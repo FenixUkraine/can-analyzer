@@ -1,0 +1,54 @@
+{
+  "vehicle": "mazda",
+  "event_id": 38,
+  "mode": "button",
+  "event_dir": "D:\\fenix\\python\\analyzer\\mazda\\38",
+  "rule_line": "38:B:0,ID:9E,BY:6,BI:1,D:0;",
+  "candidates": [
+    {
+      "event_id": 38,
+      "mode": "button",
+      "reason": "exact_press_release_count",
+      "bus": 0,
+      "id_hex": "9E",
+      "byte": 6,
+      "bit_lsb0": 1,
+      "bit_out": 1,
+      "expected": 0,
+      "score": 1069.0,
+      "idle_samples": 174,
+      "open_samples": 0,
+      "action_samples": 9,
+      "action_transitions": 6,
+      "press_count": 3,
+      "overflow": false,
+      "rule": "B:0,ID:9E,BY:6,BI:1,D:0;"
+    }
+  ],
+  "dropped_busy_frames": [],
+  "event_only_debug": [
+    {
+      "bus": 0,
+      "id_hex": "40",
+      "button_frames": 3,
+      "button_payloads": [
+        "C8 00 00 00 00 00 00 00",
+        "07 35 D2 29 13 00 00 00",
+        "81 7F 00 00 00 00 00 00"
+      ],
+      "note": "ID was not present in idle; treated as debug only, not a bit rule"
+    },
+    {
+      "bus": 0,
+      "id_hex": "46",
+      "button_frames": 3,
+      "button_payloads": [
+        "06 7F 01 00 00 00 00 00",
+        "08 73 06 C3 B4 00 00 00",
+        "00 00 00 00 00 00 00 00"
+      ],
+      "note": "ID was not present in idle; treated as debug only, not a bit rule"
+    }
+  ],
+  "warnings": []
+}

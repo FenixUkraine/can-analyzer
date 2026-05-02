@@ -1,0 +1,50 @@
+{
+  "vehicle": "kia",
+  "event_id": 37,
+  "mode": "button",
+  "event_dir": "D:\\fenix\\python\\analyzer\\kia\\37",
+  "rule_line": "37:B:0,ID:120,BY:0,BI:5,D:1;B:0,ID:120,BY:0,BI:6,D:1;",
+  "candidates": [
+    {
+      "event_id": 37,
+      "mode": "button",
+      "reason": "exact_press_release_count",
+      "bus": 0,
+      "id_hex": "120",
+      "byte": 0,
+      "bit_lsb0": 5,
+      "bit_out": 5,
+      "expected": 1,
+      "score": 1078.0,
+      "idle_samples": 56,
+      "open_samples": 0,
+      "action_samples": 18,
+      "action_transitions": 6,
+      "press_count": 3,
+      "overflow": false,
+      "rule": "B:0,ID:120,BY:0,BI:5,D:1;"
+    },
+    {
+      "event_id": 37,
+      "mode": "button",
+      "reason": "exact_press_release_count",
+      "bus": 0,
+      "id_hex": "120",
+      "byte": 0,
+      "bit_lsb0": 6,
+      "bit_out": 6,
+      "expected": 1,
+      "score": 1072.0,
+      "idle_samples": 56,
+      "open_samples": 0,
+      "action_samples": 12,
+      "action_transitions": 6,
+      "press_count": 3,
+      "overflow": false,
+      "rule": "B:0,ID:120,BY:0,BI:6,D:1;"
+    }
+  ],
+  "dropped_busy_frames": [],
+  "event_only_debug": [],
+  "warnings": []
+}
