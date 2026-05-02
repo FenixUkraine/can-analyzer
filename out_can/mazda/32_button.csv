@@ -1,7 +1,0 @@
-event_id,mode,reason,bus,id_hex,byte,bit_lsb0,bit_out,expected,score,idle_samples,open_samples,action_samples,action_transitions,press_count,overflow,rule
-32,button,exact_press_release_count,0,4FE,7,1,1,1,1105.0,174,0,45,6,3,False,"B:0,ID:4FE,BY:7,BI:1,D:1;"
-32,button,exact_press_release_count,0,9D,1,5,5,1,1074.0,174,0,14,6,3,False,"B:0,ID:9D,BY:1,BI:5,D:1;"
-32,button,exact_press_release_count,0,9D,1,6,6,1,1074.0,174,0,14,6,3,False,"B:0,ID:9D,BY:1,BI:6,D:1;"
-32,button,exact_press_release_count,0,9D,3,6,6,0,1074.0,174,0,14,6,3,False,"B:0,ID:9D,BY:3,BI:6,D:0;"
-32,button,exact_press_release_count,0,9D,3,7,7,0,1074.0,174,0,14,6,3,False,"B:0,ID:9D,BY:3,BI:7,D:0;"
-32,button,exact_press_release_count,0,43D,2,0,0,0,1063.0,87,0,3,6,3,False,"B:0,ID:43D,BY:2,BI:0,D:0;"

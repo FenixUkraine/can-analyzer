@@ -1,2 +1,0 @@
-event_id,mode,reason,bus,id_hex,byte,bit_lsb0,bit_out,expected,score,idle_samples,open_samples,action_samples,action_transitions,press_count,overflow,rule
-2,state,idle_open_diff_confirmed_by_toggle,0,541,1,0,0,1,1146.0,32,108,158,4,,False,"B:0,ID:541,BY:1,BI:0,D:1;"

@@ -1,2 +1,0 @@
-event_id,mode,reason,bus,id_hex,byte,bit_lsb0,bit_out,expected,score,idle_samples,open_samples,action_samples,action_transitions,press_count,overflow,rule
-16,button,exact_press_release_count,0,112,0,3,3,1,1073.0,45,0,13,6,3,False,"B:0,ID:112,BY:0,BI:3,D:1;"

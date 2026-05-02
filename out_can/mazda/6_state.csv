@@ -1,9 +1,0 @@
-event_id,mode,reason,bus,id_hex,byte,bit_lsb0,bit_out,expected,score,idle_samples,open_samples,action_samples,action_transitions,press_count,overflow,rule
-6,state,idle_open_diff_confirmed_by_toggle,0,473,4,7,7,0,2047.0,121,83,183,50,,False,"B:0,ID:473,BY:4,BI:7,D:0;"
-6,state,idle_open_diff_confirmed_by_toggle,0,217,3,2,2,1,1835.0,1205,828,1744,2,,False,"B:0,ID:217,BY:3,BI:2,D:1;"
-6,state,idle_open_diff_confirmed_by_toggle,0,473,3,4,4,1,1379.0,121,83,183,15,,False,"B:0,ID:473,BY:3,BI:4,D:1;"
-6,state,idle_open_diff_confirmed_by_toggle,0,473,4,3,3,1,1378.0,121,83,183,15,,False,"B:0,ID:473,BY:4,BI:3,D:1;"
-6,state,idle_open_diff_confirmed_by_toggle,0,473,6,4,4,0,1136.0,121,83,183,3,,False,"B:0,ID:473,BY:6,BI:4,D:0;"
-6,state,idle_open_diff_confirmed_by_toggle,0,473,4,5,5,1,1134.0,121,83,183,3,,False,"B:0,ID:473,BY:4,BI:5,D:1;"
-6,state,idle_open_diff_confirmed_by_toggle,0,473,3,6,6,1,1133.0,121,83,183,3,,False,"B:0,ID:473,BY:3,BI:6,D:1;"
-6,state,idle_open_diff_confirmed_by_toggle,0,43E,4,0,0,1,1078.0,48,35,73,3,,False,"B:0,ID:43E,BY:4,BI:0,D:1;"
