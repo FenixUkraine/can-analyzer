@@ -32,7 +32,7 @@ import math
 import re
 import sys
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import DefaultDict, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
@@ -202,6 +202,16 @@ class ActivityStats:
 
 
 @dataclass
+class RuleVariant:
+    name: str
+    rule_line: str
+    candidates: List[Candidate]
+    dropped_busy_frames: List[Dict[str, object]]
+    validation_rejected: List[Dict[str, object]]
+    note: str = ""
+
+
+@dataclass
 class EventResult:
     vehicle: str
     event_id: int
@@ -213,7 +223,9 @@ class EventResult:
     event_only_debug: List[Dict[str, object]]
     validation_rejected: List[Dict[str, object]]
     dynamic_suspects: List[Dict[str, object]]
+    dropped_dynamic_ids: List[Dict[str, object]]
     warnings: List[str]
+    alternate_variants: List[RuleVariant] = field(default_factory=list)
 
 
 class TrcParseError(Exception):
@@ -578,6 +590,98 @@ def build_dynamic_suspects(
     return per_candidate_byte, rows[: args.max_dynamic_suspects]
 
 
+def parse_source_filter(value: str) -> set[str]:
+    sources = {x.strip().lower() for x in value.split(",") if x.strip()}
+    if not sources:
+        return {"idle", "open", "toggle", "button"}
+    if "all" in sources:
+        sources.update({"idle", "open", "toggle", "button"})
+    return sources
+
+
+def changed_bits_for_frames(frames: Sequence[Frame], *, max_dlc: int) -> Tuple[int, List[str]]:
+    """Count payload bits that take both 0 and 1 values inside one recording/source."""
+    if not frames:
+        return 0, []
+
+    nbytes = 0
+    for fr in frames:
+        nbytes = max(nbytes, min(fr.dlc, max_dlc))
+    changed: List[str] = []
+
+    for by in range(nbytes):
+        for bit in range(8):
+            info = bit_info(frames, by, bit)
+            if info.values_mask == 3:
+                changed.append(f"BY:{by}/BI:{bit}")
+
+    return len(changed), changed
+
+
+def build_too_dynamic_id_drops(
+    grouped_sources: Dict[str, Dict[RuleKey, List[Frame]]],
+    *,
+    max_dlc: int,
+    args: argparse.Namespace,
+) -> Tuple[set[RuleKey], List[Dict[str, object]]]:
+    """Optionally drop whole CAN IDs whose payload changes too much.
+
+    This is intentionally a hard filter only when the user passes
+    --drop-ids-with-too-many-changing-bits. The earlier counter/checksum logic remains
+    soft annotation and does not reject candidates by itself.
+    """
+    if not args.drop_ids_with_too_many_changing_bits:
+        return set(), []
+
+    source_filter = parse_source_filter(args.dynamic_id_check_sources)
+    all_keys: set[RuleKey] = set()
+    for source_group in grouped_sources.values():
+        all_keys |= set(source_group.keys())
+
+    dropped_keys: set[RuleKey] = set()
+    dropped_rows: List[Dict[str, object]] = []
+
+    for key in sorted(all_keys):
+        bus, can_id = key
+
+        sources_to_check: List[Tuple[str, Sequence[Frame]]] = []
+        for source_name, source_group in grouped_sources.items():
+            if source_name.lower() in source_filter:
+                frames = source_group.get(key, [])
+                if frames:
+                    sources_to_check.append((source_name, frames))
+
+        if args.dynamic_id_include_combined:
+            combined: List[Frame] = []
+            for source_group in grouped_sources.values():
+                combined.extend(source_group.get(key, []))
+            if combined:
+                sources_to_check.append(("combined", sorted(combined, key=lambda x: x.t)))
+
+        for source_name, frames in sources_to_check:
+            if len(frames) < args.dynamic_id_min_samples:
+                continue
+            changing_bits, changed_list = changed_bits_for_frames(frames, max_dlc=max_dlc)
+            if changing_bits > args.max_changing_bits_per_id:
+                dropped_keys.add(key)
+                dropped_rows.append(
+                    {
+                        "bus": bus,
+                        "id_hex": f"{can_id:X}",
+                        "source": source_name,
+                        "frames": len(frames),
+                        "changing_bits": changing_bits,
+                        "limit": args.max_changing_bits_per_id,
+                        "reason": "too_many_changing_bits",
+                        "changed_bits_preview": " ".join(changed_list[: args.dynamic_id_changed_bits_preview]),
+                    }
+                )
+                # One source is enough to drop this ID; continue gathering rows for transparency.
+
+    dropped_rows.sort(key=lambda r: (r["bus"], str(r["id_hex"]), str(r["source"])))
+    return dropped_keys, dropped_rows[: args.max_dynamic_id_drops]
+
+
 def annotate_candidates_with_dynamic_suspects(
     candidates: List[Candidate],
     dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
@@ -820,44 +924,29 @@ def validate_button_candidates(
     return valid, rejected[: args.max_validation_rejected]
 
 
-def analyze_state_event(
+def build_state_rule_variant(
     *,
-    vehicle: str,
+    name: str,
     event_id: int,
-    event_dir: Path,
-    idle_path: Path,
-    open_path: Path,
-    toggle_path: Path,
+    idle: Dict[RuleKey, List[Frame]],
+    opened: Dict[RuleKey, List[Frame]],
+    toggle: Dict[RuleKey, List[Frame]],
+    keys: Iterable[RuleKey],
+    dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
     args: argparse.Namespace,
-) -> EventResult:
-    warnings: List[str] = []
-    idle_frames = parse_trc(idle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
-    open_frames = parse_trc(open_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
-    toggle_frames = parse_trc(toggle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+    note: str = "",
+) -> RuleVariant:
+    """Build and validate one state-analysis variant.
 
-    if not idle_frames:
-        warnings.append(f"idle file has no parsed frames: {idle_path}")
-    if not open_frames:
-        warnings.append(f"open file has no parsed frames: {open_path}")
-    if not toggle_frames:
-        warnings.append(f"toggle file has no parsed frames: {toggle_path}")
-
-    idle = group_frames(idle_frames)
-    opened = group_frames(open_frames)
-    toggle = group_frames(toggle_frames)
-    dynamic_by_byte, dynamic_suspects = build_dynamic_suspects(
-        {"idle": idle, "open": opened, "toggle": toggle},
-        max_dlc=args.max_dlc,
-        args=args,
-    )
-
-    keys = set(idle) | set(opened) | set(toggle)
+    The default variant uses the normal key set. The idle_ids_only variant uses only
+    CAN IDs that already existed in idle.trc, which is useful when open.trc contains
+    extra event-only traffic and you want a conservative rule set for comparison.
+    """
     strict: List[Candidate] = []
     fallback: List[Candidate] = []
     event_only: List[Candidate] = []
-    debug_event_only: List[Dict[str, object]] = []
 
-    for key in sorted(keys):
+    for key in sorted(set(keys)):
         bus, can_id = key
         idle_list = idle.get(key, [])
         open_list = opened.get(key, [])
@@ -943,18 +1032,6 @@ def analyze_state_event(
                             )
                         )
 
-        if not idle_list and (open_list or toggle_list):
-            debug_event_only.append(
-                {
-                    "bus": bus,
-                    "id_hex": f"{can_id:X}",
-                    "open_frames": len(open_list),
-                    "toggle_frames": len(toggle_list),
-                    "open_payloads": first_payloads(open_list),
-                    "toggle_payloads": first_payloads(toggle_list),
-                }
-            )
-
     # Prefer strict candidates. Use fallback only if strict is empty.
     selected = strict if strict else fallback
     if not selected and (args.include_event_only or args.event_only_if_empty):
@@ -977,20 +1054,129 @@ def analyze_state_event(
     if not selected:
         rule_line = f"{event_id}:error:No changes found"
 
+    return RuleVariant(
+        name=name,
+        rule_line=rule_line,
+        candidates=selected,
+        dropped_busy_frames=dropped,
+        validation_rejected=validation_rejected,
+        note=note,
+    )
+
+
+def analyze_state_event(
+    *,
+    vehicle: str,
+    event_id: int,
+    event_dir: Path,
+    idle_path: Path,
+    open_path: Path,
+    toggle_path: Path,
+    args: argparse.Namespace,
+) -> EventResult:
+    warnings: List[str] = []
+    idle_frames = parse_trc(idle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+    open_frames = parse_trc(open_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+    toggle_frames = parse_trc(toggle_path, channel_base=args.trc_channel_base, force_bus=args.force_bus, max_dlc=args.max_dlc)
+
+    if not idle_frames:
+        warnings.append(f"idle file has no parsed frames: {idle_path}")
+    if not open_frames:
+        warnings.append(f"open file has no parsed frames: {open_path}")
+    if not toggle_frames:
+        warnings.append(f"toggle file has no parsed frames: {toggle_path}")
+
+    idle = group_frames(idle_frames)
+    opened = group_frames(open_frames)
+    toggle = group_frames(toggle_frames)
+    dynamic_by_byte, dynamic_suspects = build_dynamic_suspects(
+        {"idle": idle, "open": opened, "toggle": toggle},
+        max_dlc=args.max_dlc,
+        args=args,
+    )
+
+    dynamic_id_drop_keys, dropped_dynamic_ids = build_too_dynamic_id_drops(
+        {"idle": idle, "open": opened, "toggle": toggle},
+        max_dlc=args.max_dlc,
+        args=args,
+    )
+    default_keys_all = set(idle) | set(opened) | set(toggle)
+    default_keys = default_keys_all - dynamic_id_drop_keys
+    if dropped_dynamic_ids:
+        warnings.append(
+            f"dropped {len(dynamic_id_drop_keys)} CAN IDs because more than "
+            f"{args.max_changing_bits_per_id} bits changed inside selected TRC source(s)"
+        )
+
+    default_variant = build_state_rule_variant(
+        name="default",
+        event_id=event_id,
+        idle=idle,
+        opened=opened,
+        toggle=toggle,
+        keys=default_keys,
+        dynamic_by_byte=dynamic_by_byte,
+        args=args,
+        note="normal analysis: idle/open/toggle key union",
+    )
+
+    debug_event_only: List[Dict[str, object]] = []
+    for key in sorted(default_keys_all):
+        bus, can_id = key
+        idle_list = idle.get(key, [])
+        open_list = opened.get(key, [])
+        toggle_list = toggle.get(key, [])
+        if not idle_list and (open_list or toggle_list):
+            debug_event_only.append(
+                {
+                    "bus": bus,
+                    "id_hex": f"{can_id:X}",
+                    "open_frames": len(open_list),
+                    "toggle_frames": len(toggle_list),
+                    "open_payloads": first_payloads(open_list),
+                    "toggle_payloads": first_payloads(toggle_list),
+                }
+            )
+
+    alternate_variants: List[RuleVariant] = []
+    open_extra_ids = set(opened) - set(idle)
+    should_make_idle_ids_only = args.idle_ids_only_variant and (
+        len(open_frames) > len(idle_frames) or bool(open_extra_ids)
+    )
+    if should_make_idle_ids_only:
+        note = (
+            f"open_frames={len(open_frames)} idle_frames={len(idle_frames)}; "
+            f"open_extra_ids={len(open_extra_ids)}; only CAN IDs present in idle.trc are analyzed"
+        )
+        idle_only_variant = build_state_rule_variant(
+            name="idle_ids_only",
+            event_id=event_id,
+            idle=idle,
+            opened=opened,
+            toggle=toggle,
+            keys=set(idle) - dynamic_id_drop_keys,
+            dynamic_by_byte=dynamic_by_byte,
+            args=args,
+            note=note,
+        )
+        alternate_variants.append(idle_only_variant)
+        warnings.append(f"created idle_ids_only variant: {note}")
+
     return EventResult(
         vehicle=vehicle,
         event_id=event_id,
         mode="state",
         event_dir=str(event_dir),
-        rule_line=rule_line,
-        candidates=selected,
-        dropped_busy_frames=dropped,
+        rule_line=default_variant.rule_line,
+        candidates=default_variant.candidates,
+        dropped_busy_frames=default_variant.dropped_busy_frames,
         event_only_debug=debug_event_only,
-        validation_rejected=validation_rejected,
+        validation_rejected=default_variant.validation_rejected,
         dynamic_suspects=dynamic_suspects,
+        dropped_dynamic_ids=dropped_dynamic_ids,
         warnings=warnings,
+        alternate_variants=alternate_variants,
     )
-
 
 def analyze_button_event(
     *,
@@ -1017,7 +1203,17 @@ def analyze_button_event(
         max_dlc=args.max_dlc,
         args=args,
     )
-    keys = set(idle) | set(pressed)
+    dynamic_id_drop_keys, dropped_dynamic_ids = build_too_dynamic_id_drops(
+        {"idle": idle, "button": pressed},
+        max_dlc=args.max_dlc,
+        args=args,
+    )
+    keys = (set(idle) | set(pressed)) - dynamic_id_drop_keys
+    if dropped_dynamic_ids:
+        warnings.append(
+            f"dropped {len(dynamic_id_drop_keys)} CAN IDs because more than "
+            f"{args.max_changing_bits_per_id} bits changed inside selected TRC source(s)"
+        )
 
     candidates: List[Candidate] = []
     debug_event_only: List[Dict[str, object]] = []
@@ -1100,6 +1296,7 @@ def analyze_button_event(
         event_only_debug=debug_event_only,
         validation_rejected=validation_rejected,
         dynamic_suspects=dynamic_suspects,
+        dropped_dynamic_ids=dropped_dynamic_ids,
         warnings=warnings,
     )
 
@@ -1165,6 +1362,14 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
         for c in result.candidates:
             writer.writerow(c.as_row(bit_order))
 
+    for v in result.alternate_variants:
+        variant_base = vehicle_dir / f"{result.event_id}_{result.mode}__{v.name}"
+        with (variant_base.with_suffix(".csv")).open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for c in v.candidates:
+                writer.writerow(c.as_row(bit_order))
+
     with (base.with_suffix(".json")).open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -1178,6 +1383,18 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
                 "event_only_debug": result.event_only_debug,
                 "validation_rejected": result.validation_rejected,
                 "dynamic_suspects": result.dynamic_suspects,
+                "dropped_dynamic_ids": result.dropped_dynamic_ids,
+                "alternate_variants": [
+                    {
+                        "name": v.name,
+                        "note": v.note,
+                        "rule_line": v.rule_line,
+                        "candidates": [c.as_row(bit_order) for c in v.candidates],
+                        "dropped_busy_frames": v.dropped_busy_frames,
+                        "validation_rejected": v.validation_rejected,
+                    }
+                    for v in result.alternate_variants
+                ],
                 "warnings": result.warnings,
             },
             f,
@@ -1201,6 +1418,63 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
             for r in items:
                 f.write(r.rule_line + "\n")
 
+        variant_names = sorted({v.name for r in items for v in r.alternate_variants})
+        for variant_name in variant_names:
+            with (vehicle_dir / f"scan_data_{variant_name}.txt").open("w", encoding="utf-8") as f:
+                for r in items:
+                    variant = next((v for v in r.alternate_variants if v.name == variant_name), None)
+                    # Keep the file complete: if this event did not need the variant, reuse default rule.
+                    f.write((variant.rule_line if variant is not None else r.rule_line) + "\n")
+
+        with (vehicle_dir / "summary_variants.csv").open("w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "vehicle",
+                "event_id",
+                "mode",
+                "variant",
+                "candidate_count",
+                "suspect_candidates",
+                "dropped_busy_frames",
+                "dropped_dynamic_ids",
+                "validation_rejected",
+                "note",
+                "rule_line",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in items:
+                writer.writerow(
+                    {
+                        "vehicle": r.vehicle,
+                        "event_id": r.event_id,
+                        "mode": r.mode,
+                        "variant": "default",
+                        "candidate_count": len(r.candidates),
+                        "suspect_candidates": sum(1 for c in r.candidates if c.suspect),
+                        "dropped_busy_frames": len(r.dropped_busy_frames),
+                        "dropped_dynamic_ids": len(r.dropped_dynamic_ids),
+                        "validation_rejected": len(r.validation_rejected),
+                        "note": "normal analysis: idle/open/toggle key union" if r.mode == "state" else "",
+                        "rule_line": r.rule_line,
+                    }
+                )
+                for v in r.alternate_variants:
+                    writer.writerow(
+                        {
+                            "vehicle": r.vehicle,
+                            "event_id": r.event_id,
+                            "mode": r.mode,
+                            "variant": v.name,
+                            "candidate_count": len(v.candidates),
+                            "suspect_candidates": sum(1 for c in v.candidates if c.suspect),
+                            "dropped_busy_frames": len(v.dropped_busy_frames),
+                            "dropped_dynamic_ids": len(r.dropped_dynamic_ids),
+                            "validation_rejected": len(v.validation_rejected),
+                            "note": v.note,
+                            "rule_line": v.rule_line,
+                        }
+                    )
+
         with (vehicle_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
             fieldnames = [
                 "vehicle",
@@ -1210,7 +1484,11 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                 "suspect_candidates",
                 "dynamic_suspects",
                 "dropped_busy_frames",
+                "dropped_dynamic_ids",
                 "validation_rejected",
+                "alternate_variants",
+                "idle_ids_only_candidate_count",
+                "idle_ids_only_rule_line",
                 "warnings",
                 "rule_line",
             ]
@@ -1226,7 +1504,11 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                         "suspect_candidates": sum(1 for c in r.candidates if c.suspect),
                         "dynamic_suspects": len(r.dynamic_suspects),
                         "dropped_busy_frames": len(r.dropped_busy_frames),
+                        "dropped_dynamic_ids": len(r.dropped_dynamic_ids),
                         "validation_rejected": len(r.validation_rejected),
+                        "alternate_variants": ",".join(v.name for v in r.alternate_variants),
+                        "idle_ids_only_candidate_count": next((len(v.candidates) for v in r.alternate_variants if v.name == "idle_ids_only"), ""),
+                        "idle_ids_only_rule_line": next((v.rule_line for v in r.alternate_variants if v.name == "idle_ids_only"), ""),
                         "warnings": " | ".join(r.warnings),
                         "rule_line": r.rule_line,
                     }
@@ -1254,6 +1536,28 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
             writer.writeheader()
             for r in items:
                 for row in r.dynamic_suspects:
+                    out_row = dict(row)
+                    out_row["event_id"] = r.event_id
+                    out_row["mode"] = r.mode
+                    writer.writerow(out_row)
+
+        with (vehicle_dir / "dropped_dynamic_ids.csv").open("w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "event_id",
+                "mode",
+                "bus",
+                "id_hex",
+                "source",
+                "frames",
+                "changing_bits",
+                "limit",
+                "reason",
+                "changed_bits_preview",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for r in items:
+                for row in r.dropped_dynamic_ids:
                     out_row = dict(row)
                     out_row["event_id"] = r.event_id
                     out_row["mode"] = r.mode
@@ -1312,6 +1616,13 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--checksum-transition-ratio", type=float, default=0.80, help="Checksum/CRC suspect: min byte transition ratio")
     p.add_argument("--checksum-entropy-threshold", type=float, default=0.70, help="Checksum/CRC suspect: normalized entropy threshold")
     p.add_argument("--max-dynamic-suspects", type=int, default=300, help="Max dynamic byte suspect rows to store per event JSON and combined CSV")
+    p.add_argument("--drop-ids-with-too-many-changing-bits", action="store_true", help="Hard-drop whole CAN IDs when too many payload bits change inside selected TRC source(s)")
+    p.add_argument("--max-changing-bits-per-id", type=int, default=16, help="Used with --drop-ids-with-too-many-changing-bits: drop ID if more than this many bits change")
+    p.add_argument("--dynamic-id-min-samples", type=int, default=8, help="Min frames of an ID in a source before checking too-many-changing-bits")
+    p.add_argument("--dynamic-id-check-sources", default="idle,open,toggle,button", help="Comma-separated sources for ID-level dynamic drop: idle,open,toggle,button,all")
+    p.add_argument("--dynamic-id-include-combined", action="store_true", help="Also check changing bits on all sources combined; stricter and can drop valid state IDs")
+    p.add_argument("--dynamic-id-changed-bits-preview", type=int, default=48, help="How many changed bit names to store in dropped_dynamic_ids.csv/JSON")
+    p.add_argument("--max-dynamic-id-drops", type=int, default=300, help="Max ID-level dynamic drop rows to store per event")
     p.add_argument("--max-bits-per-frame", type=int, default=6, help="Drop state frames with more candidate bits than this; 0 disables")
     p.add_argument("--button-max-bits-per-frame", type=int, default=16, help="Drop button frames with more candidate bits than this; 0 disables")
     p.add_argument("--max-signals-per-event", type=int, default=60, help="Limit output rules per event")
@@ -1319,6 +1630,7 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--allow-unreleased-last-press", action="store_true", help="Button mode: allow the recording to end while the last press is still active")
     p.add_argument("--include-event-only", action="store_true", help="Include frames absent in idle as rules, not only debug suggestions")
     p.add_argument("--event-only-if-empty", action="store_true", default=True, help="Use event-only candidates only if normal state detection found nothing")
+    p.add_argument("--idle-ids-only-variant", action=argparse.BooleanOptionalAction, default=True, help="State mode: when open.trc has more frames or extra IDs, also log/write an idle_ids_only variant that analyzes only CAN IDs present in idle.trc")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1352,13 +1664,17 @@ def print_summary(results: List[EventResult]) -> None:
         print("No events analyzed")
         return
     print("\nSummary:")
-    print(f"{'vehicle':12} {'event':>5} {'mode':8} {'rules':>5} {'susp':>5} {'dyn':>5} {'dropped':>7} {'reject':>7}  rule")
-    print("-" * 122)
+    print(f"{'vehicle':12} {'event':>5} {'mode':20} {'rules':>5} {'susp':>5} {'dyn':>5} {'drop_id':>7} {'dropped':>7} {'reject':>7}  rule")
+    print("-" * 146)
     for r in sorted(results, key=lambda x: (x.vehicle, x.event_id)):
-        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:8} {len(r.candidates):5d} {sum(1 for c in r.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
+        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:20} {len(r.candidates):5d} {sum(1 for c in r.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(r.dropped_dynamic_ids):7d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
+        for v in r.alternate_variants:
+            mode_name = f"{r.mode}/{v.name}"
+            print(f"{r.vehicle:12} {r.event_id:5d} {mode_name:20} {len(v.candidates):5d} {sum(1 for c in v.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(r.dropped_dynamic_ids):7d} {len(v.dropped_busy_frames):7d} {len(v.validation_rejected):7d}  {v.rule_line}")
+            if v.note:
+                print(f"  NOTE: {v.note}")
         for w in r.warnings:
             print(f"  WARN: {w}")
-
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
