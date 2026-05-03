@@ -1,3 +1,5 @@
 python main.py auto --root kia --out out_can_scan --min-state-transitions 2
 python main.py auto --root mazda --out out_can_scan --drop-ids-with-too-many-changing-bits --max-changing-bits-per-id 8 --min-state-transitions 2
 python main.py auto --root mazda --out out_can_scan --drop-ids-with-too-many-changing-bits --max-changing-bits-per-id 4 --min-state-transitions 2
+python main.py auto --root kia --out out_can_scan --drop-ids-with-too-many-changing-bits --max-changing-bits-per-id 4 --min-state-transitions 2
+python main.py auto --root mazda --out out_can_scan --drop-ids-with-too-many-changing-bits --max-changing-bits-per-id 4 --min-state-transitions 2

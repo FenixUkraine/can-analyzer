@@ -21,6 +21,11 @@ Output rule format is compatible with the firmware text rules:
   <event_id>:B:<bus>,ID:<hex>,BY:<byte>,BI:<bit>,D:<0|1>;...
 
 Default bit numbering is lsb0 because the firmware uses BIT(bit_index).
+
+This version also performs a firmware-like final validation step: after candidate bits
+pass per-bit checks, the script simulates the alarm firmware cache and evaluates the
+complete rule as an AND across all selected bits. This avoids generating rules where
+each bit looks correct separately but the full rule never becomes active.
 """
 
 from __future__ import annotations
@@ -202,6 +207,305 @@ class ActivityStats:
 
 
 @dataclass
+class FirmwareRuleValidation:
+    ok: bool
+    reason: str
+    idle_stats: ActivityStats
+    open_stats: Optional[ActivityStats] = None
+    action_stats: Optional[ActivityStats] = None
+
+
+def candidates_rule_line(event_id: int, candidates: Sequence[Candidate], bit_order: str) -> str:
+    if not candidates:
+        return f"{event_id}:error:No changes found"
+    return f"{event_id}:" + "".join(c.descriptor(bit_order) for c in candidates)
+
+
+def frame_cache_after(frames: Sequence[Frame]) -> Dict[RuleKey, Tuple[int, ...]]:
+    """Build the same kind of last-frame cache the firmware has after replaying frames."""
+    cache: Dict[RuleKey, Tuple[int, ...]] = {}
+    for fr in sorted(frames, key=lambda x: x.t):
+        cache[(fr.bus, fr.can_id)] = tuple(fr.data[: fr.dlc])
+    return cache
+
+
+def evaluate_candidate_rule_from_cache(
+    candidates: Sequence[Candidate],
+    cache: Dict[RuleKey, Tuple[int, ...]],
+) -> bool:
+    """Evaluate a complete rule exactly like firmware evaluate_rule().
+
+    Missing cached frame, too short DLC, or any bit mismatch makes the whole rule false.
+    This is the important difference from the older per-candidate validation.
+    """
+    if not candidates:
+        return False
+
+    for c in candidates:
+        data = cache.get((c.bus, c.can_id))
+        if data is None or c.byte >= len(data):
+            return False
+        if bit_value(data, c.byte, c.bit_lsb0) != c.expected:
+            return False
+    return True
+
+
+def simulate_firmware_rule_activity(
+    frames: Sequence[Frame],
+    candidates: Sequence[Candidate],
+    *,
+    initial_cache: Optional[Dict[RuleKey, Tuple[int, ...]]] = None,
+    ignore_not_ready: bool = False,
+) -> ActivityStats:
+    """Replay frames through a simplified firmware model and count full-rule activity.
+
+    Firmware behavior mirrored here:
+      * keep the last received payload for every (bus, CAN ID);
+      * after every received frame, evaluate the full rule as AND across all rule bits;
+      * missing frames or DLC shorter than the rule requirement mean false.
+
+    If ignore_not_ready is enabled, samples before all rule CAN IDs have been seen are skipped.
+    It is disabled by default because the firmware does not skip them; missing cache evaluates false.
+    """
+    stats = ActivityStats()
+    if not candidates:
+        return stats
+
+    cache: Dict[RuleKey, Tuple[int, ...]] = dict(initial_cache or {})
+    required_keys = {(c.bus, c.can_id) for c in candidates}
+
+    for fr in sorted(frames, key=lambda x: x.t):
+        cache[(fr.bus, fr.can_id)] = tuple(fr.data[: fr.dlc])
+        if ignore_not_ready and not required_keys.issubset(cache.keys()):
+            continue
+        stats.add(evaluate_candidate_rule_from_cache(candidates, cache))
+
+    return stats
+
+
+def validate_state_rule_firmware_like(
+    candidates: Sequence[Candidate],
+    *,
+    idle_frames: Sequence[Frame],
+    open_frames: Sequence[Frame],
+    toggle_frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> FirmwareRuleValidation:
+    """Validate the complete state rule, not individual bits.
+
+    The idle recording is simulated from an empty cache. Open/toggle recordings are simulated
+    with the cache preloaded by idle.trc because the replay tester also sends idle before action.
+    """
+    empty = ActivityStats()
+    if not candidates:
+        return FirmwareRuleValidation(False, "firmware_empty_rule", empty, empty, empty)
+
+    idle_stats = simulate_firmware_rule_activity(
+        idle_frames,
+        candidates,
+        ignore_not_ready=args.firmware_ignore_not_ready,
+    )
+    idle_cache = frame_cache_after(idle_frames)
+    open_stats = simulate_firmware_rule_activity(
+        open_frames,
+        candidates,
+        initial_cache=idle_cache,
+        ignore_not_ready=args.firmware_ignore_not_ready,
+    )
+    toggle_stats = simulate_firmware_rule_activity(
+        toggle_frames,
+        candidates,
+        initial_cache=idle_cache,
+        ignore_not_ready=args.firmware_ignore_not_ready,
+    )
+
+    # In idle the full rule must not become active. If there are zero samples, the
+    # firmware would still evaluate false for missing cache, but zero samples usually means
+    # the recording is not useful for proving the rule. Keep the same conservative default
+    # as per-bit validation unless the user explicitly allows missing idle as inactive.
+    if idle_stats.samples <= 0 and not args.allow_missing_idle_as_inactive:
+        return FirmwareRuleValidation(False, "firmware_idle_no_eval_samples", idle_stats, open_stats, toggle_stats)
+    if idle_stats.active_samples > args.max_idle_active_samples:
+        return FirmwareRuleValidation(False, "firmware_idle_is_active", idle_stats, open_stats, toggle_stats)
+
+    # Open must turn the full rule ON and leave it ON. For a multi-frame rule the first
+    # few action frames may still be false until all needed IDs have refreshed from idle,
+    # so this check is intentionally less brittle than requiring active_ratio == 1.0.
+    if open_stats.samples < args.firmware_min_eval_samples:
+        return FirmwareRuleValidation(False, "firmware_open_too_few_eval_samples", idle_stats, open_stats, toggle_stats)
+    if open_stats.active_samples <= 0:
+        return FirmwareRuleValidation(False, "firmware_open_never_active", idle_stats, open_stats, toggle_stats)
+    if open_stats.active_ratio < args.firmware_min_open_active_ratio:
+        return FirmwareRuleValidation(False, "firmware_open_not_active_enough", idle_stats, open_stats, toggle_stats)
+    if args.firmware_require_open_final_active and open_stats.last_active is not True:
+        return FirmwareRuleValidation(False, "firmware_open_final_not_active", idle_stats, open_stats, toggle_stats)
+
+    # Toggle must really switch the full rule, not just its individual bits.
+    if toggle_stats.samples < args.firmware_min_eval_samples:
+        return FirmwareRuleValidation(False, "firmware_toggle_too_few_eval_samples", idle_stats, open_stats, toggle_stats)
+    if toggle_stats.active_samples <= 0:
+        return FirmwareRuleValidation(False, "firmware_toggle_never_active", idle_stats, open_stats, toggle_stats)
+    if toggle_stats.inactive_samples <= 0:
+        return FirmwareRuleValidation(False, "firmware_toggle_never_inactive", idle_stats, open_stats, toggle_stats)
+    if toggle_stats.transitions < args.min_state_transitions:
+        return FirmwareRuleValidation(False, "firmware_toggle_not_switching", idle_stats, open_stats, toggle_stats)
+    if toggle_stats.active_segments < args.min_toggle_activations:
+        return FirmwareRuleValidation(False, "firmware_toggle_too_few_active_segments", idle_stats, open_stats, toggle_stats)
+
+    return FirmwareRuleValidation(True, "ok", idle_stats, open_stats, toggle_stats)
+
+
+def validate_button_rule_firmware_like(
+    candidates: Sequence[Candidate],
+    *,
+    idle_frames: Sequence[Frame],
+    button_frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> FirmwareRuleValidation:
+    """Validate the complete button rule through firmware-like cache + AND semantics."""
+    empty = ActivityStats()
+    if not candidates:
+        return FirmwareRuleValidation(False, "firmware_empty_rule", empty, None, empty)
+
+    idle_stats = simulate_firmware_rule_activity(
+        idle_frames,
+        candidates,
+        ignore_not_ready=args.firmware_ignore_not_ready,
+    )
+    idle_cache = frame_cache_after(idle_frames)
+    button_stats = simulate_firmware_rule_activity(
+        button_frames,
+        candidates,
+        initial_cache=idle_cache,
+        ignore_not_ready=args.firmware_ignore_not_ready,
+    )
+
+    if idle_stats.samples <= 0 and not args.allow_missing_idle_as_inactive:
+        return FirmwareRuleValidation(False, "firmware_idle_no_eval_samples", idle_stats, None, button_stats)
+    if idle_stats.active_samples > args.max_idle_active_samples:
+        return FirmwareRuleValidation(False, "firmware_idle_is_active", idle_stats, None, button_stats)
+
+    if button_stats.samples < args.firmware_min_eval_samples:
+        return FirmwareRuleValidation(False, "firmware_button_too_few_eval_samples", idle_stats, None, button_stats)
+    if button_stats.active_segments != args.expected_presses:
+        return FirmwareRuleValidation(False, "firmware_button_press_count_not_exact", idle_stats, None, button_stats)
+    if button_stats.active_samples < args.expected_presses:
+        return FirmwareRuleValidation(False, "firmware_button_too_few_active_samples", idle_stats, None, button_stats)
+    if button_stats.inactive_samples <= 0 and not args.allow_unreleased_last_press:
+        return FirmwareRuleValidation(False, "firmware_button_never_returns_inactive", idle_stats, None, button_stats)
+
+    return FirmwareRuleValidation(True, "ok", idle_stats, None, button_stats)
+
+
+def firmware_reject_row(
+    candidate: Candidate,
+    *,
+    reason: str,
+    bit_order: str,
+    trial_size: int,
+    kept_before: int,
+    validation: FirmwareRuleValidation,
+) -> Dict[str, object]:
+    row = validation_reject_row(
+        candidate,
+        reason=f"firmware_rule_{reason}",
+        bit_order=bit_order,
+        idle_stats=validation.idle_stats,
+        open_stats=validation.open_stats,
+        action_stats=validation.action_stats,
+    )
+    row["firmware_trial_size"] = trial_size
+    row["firmware_kept_before"] = kept_before
+    return row
+
+
+def select_state_candidates_firmware_like(
+    candidates: Sequence[Candidate],
+    *,
+    idle_frames: Sequence[Frame],
+    open_frames: Sequence[Frame],
+    toggle_frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> Tuple[List[Candidate], List[Dict[str, object]]]:
+    """Greedily keep only candidates that preserve full-rule firmware validation."""
+    ordered = sort_candidates(list(candidates))
+    if not args.firmware_validate_rules:
+        return ordered[: args.max_signals_per_event], []
+
+    selected: List[Candidate] = []
+    rejected: List[Dict[str, object]] = []
+
+    for c in ordered:
+        if len(selected) >= args.max_signals_per_event:
+            break
+        trial = selected + [c]
+        validation = validate_state_rule_firmware_like(
+            trial,
+            idle_frames=idle_frames,
+            open_frames=open_frames,
+            toggle_frames=toggle_frames,
+            args=args,
+        )
+        if validation.ok:
+            selected.append(c)
+        elif len(rejected) < args.max_validation_rejected:
+            rejected.append(
+                firmware_reject_row(
+                    c,
+                    reason=validation.reason,
+                    bit_order=args.bit_order,
+                    trial_size=len(trial),
+                    kept_before=len(selected),
+                    validation=validation,
+                )
+            )
+
+    return selected, rejected
+
+
+def select_button_candidates_firmware_like(
+    candidates: Sequence[Candidate],
+    *,
+    idle_frames: Sequence[Frame],
+    button_frames: Sequence[Frame],
+    args: argparse.Namespace,
+) -> Tuple[List[Candidate], List[Dict[str, object]]]:
+    """Greedily keep only candidates that preserve complete-button-rule validation."""
+    ordered = sort_candidates(list(candidates))
+    if not args.firmware_validate_rules:
+        return ordered[: args.max_signals_per_event], []
+
+    selected: List[Candidate] = []
+    rejected: List[Dict[str, object]] = []
+
+    for c in ordered:
+        if len(selected) >= args.max_signals_per_event:
+            break
+        trial = selected + [c]
+        validation = validate_button_rule_firmware_like(
+            trial,
+            idle_frames=idle_frames,
+            button_frames=button_frames,
+            args=args,
+        )
+        if validation.ok:
+            selected.append(c)
+        elif len(rejected) < args.max_validation_rejected:
+            rejected.append(
+                firmware_reject_row(
+                    c,
+                    reason=validation.reason,
+                    bit_order=args.bit_order,
+                    trial_size=len(trial),
+                    kept_before=len(selected),
+                    validation=validation,
+                )
+            )
+
+    return selected, rejected
+
+
+@dataclass
 class RuleVariant:
     name: str
     rule_line: str
@@ -273,6 +577,11 @@ def find_frame_fields(parts: Sequence[str]) -> Optional[Tuple[int, int, int]]:
     for dlc_idx in range(1, len(parts)):
         dlc = parse_int_token(parts[dlc_idx])
         if dlc is None or dlc < 0 or dlc > 64:
+            continue
+        # Avoid misparsing CAN-Hacker/TSV flags like 00000000 as DLC=0.
+        # DLC0 frames are rare in these recordings and accepting them makes the parser
+        # pick channel/flags columns as bogus CAN frames.
+        if dlc == 0:
             continue
         if dlc_idx + dlc >= len(parts):
             continue
@@ -952,6 +1261,9 @@ def build_state_rule_variant(
     idle: Dict[RuleKey, List[Frame]],
     opened: Dict[RuleKey, List[Frame]],
     toggle: Dict[RuleKey, List[Frame]],
+    idle_frames: Sequence[Frame],
+    open_frames: Sequence[Frame],
+    toggle_frames: Sequence[Frame],
     keys: Iterable[RuleKey],
     dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
     args: argparse.Namespace,
@@ -1074,11 +1386,20 @@ def build_state_rule_variant(
         enabled=args.drop_result_frames_with_too_many_bits,
         keep_if_single_frame=args.keep_single_result_frame,
     )
-    selected = sort_candidates(selected)[: args.max_signals_per_event]
 
-    rule_line = f"{event_id}:" + "".join(c.descriptor(args.bit_order) for c in selected)
-    if not selected:
-        rule_line = f"{event_id}:error:No changes found"
+    # New important step: after per-bit validation, validate the complete rule as firmware
+    # will evaluate it (last-frame cache + AND across all bits/frames). This prevents
+    # individually good bits from being combined into a rule that never becomes ON.
+    selected, firmware_rejected = select_state_candidates_firmware_like(
+        selected,
+        idle_frames=idle_frames,
+        open_frames=open_frames,
+        toggle_frames=toggle_frames,
+        args=args,
+    )
+    validation_rejected = (validation_rejected + firmware_rejected)[: args.max_validation_rejected]
+
+    rule_line = candidates_rule_line(event_id, selected, args.bit_order)
 
     return RuleVariant(
         name=name,
@@ -1133,6 +1454,9 @@ def analyze_state_event(
         idle=idle,
         opened=opened,
         toggle=toggle,
+        idle_frames=idle_frames,
+        open_frames=open_frames,
+        toggle_frames=toggle_frames,
         keys=default_keys,
         dynamic_by_byte=dynamic_by_byte,
         args=args,
@@ -1173,6 +1497,9 @@ def analyze_state_event(
             idle=idle,
             opened=opened,
             toggle=toggle,
+            idle_frames=idle_frames,
+            open_frames=open_frames,
+            toggle_frames=toggle_frames,
             keys=set(idle),
             dynamic_by_byte=dynamic_by_byte,
             args=args,
@@ -1297,10 +1624,17 @@ def analyze_button_event(
         enabled=args.drop_result_frames_with_too_many_bits,
         keep_if_single_frame=args.keep_single_result_frame,
     )
-    candidates = sort_candidates(candidates)[: args.max_signals_per_event]
-    rule_line = f"{event_id}:" + "".join(c.descriptor(args.bit_order) for c in candidates)
-    if not candidates:
-        rule_line = f"{event_id}:error:No changes found"
+
+    # New important step: button candidates must work as one complete firmware rule.
+    # The old logic accepted each bit separately and then accidentally AND-ed them together.
+    candidates, firmware_rejected = select_button_candidates_firmware_like(
+        candidates,
+        idle_frames=idle_frames,
+        button_frames=button_frames,
+        args=args,
+    )
+    validation_rejected = (validation_rejected + firmware_rejected)[: args.max_validation_rejected]
+    rule_line = candidates_rule_line(event_id, candidates, args.bit_order)
 
     return EventResult(
         vehicle=vehicle,
@@ -1696,6 +2030,45 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--max-bits-per-frame", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--button-max-bits-per-frame", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--max-signals-per-event", type=int, default=60, help="Limit output rules per event")
+    p.add_argument(
+        "--firmware-validate-rules",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After per-bit validation, greedily keep only bits that still pass a firmware-like "
+            "full-rule simulation: last-frame cache plus AND across all rule bits. Enabled by default."
+        ),
+    )
+    p.add_argument(
+        "--firmware-min-eval-samples",
+        type=int,
+        default=2,
+        help="Min firmware-simulation evaluation samples required in open/toggle/button recordings.",
+    )
+    p.add_argument(
+        "--firmware-min-open-active-ratio",
+        type=float,
+        default=0.50,
+        help=(
+            "State mode: required active ratio for the complete firmware-like rule in open.trc. "
+            "Lower than --min-open-active-ratio because multi-frame rules need a short warm-up after idle."
+        ),
+    )
+    p.add_argument(
+        "--firmware-require-open-final-active",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="State mode: require the full firmware-like rule to be ON at the end of open.trc.",
+    )
+    p.add_argument(
+        "--firmware-ignore-not-ready",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip firmware-simulation samples before all rule CAN IDs are cached. Disabled by default "
+            "because firmware itself treats missing cache as rule=false."
+        ),
+    )
     p.add_argument("--expected-presses", type=int, default=3, help="Button mode expects exactly this many complete press-release cycles")
     p.add_argument("--allow-unreleased-last-press", action="store_true", help="Button mode: allow the recording to end while the last press is still active")
     p.add_argument("--include-event-only", action="store_true", help="Include frames absent in idle as rules, not only debug suggestions")
