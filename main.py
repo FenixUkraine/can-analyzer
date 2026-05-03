@@ -26,6 +26,10 @@ This version also performs a firmware-like final validation step: after candidat
 pass per-bit checks, the script simulates the alarm firmware cache and evaluates the
 complete rule as an AND across all selected bits. This avoids generating rules where
 each bit looks correct separately but the full rule never becomes active.
+
+It also exports separate command-frame candidates. These are full CAN payloads that
+look useful for command/state analysis, even when they contain counters or CRC bytes.
+They are diagnostic outputs only and are not mixed into firmware bit rules.
 """
 
 from __future__ import annotations
@@ -516,6 +520,71 @@ class RuleVariant:
 
 
 @dataclass
+class CommandFrameCandidate:
+    event_id: int
+    mode: str
+    kind: str
+    source: str
+    reason: str
+    bus: int
+    can_id: int
+    dlc: int
+    data: Tuple[int, ...]
+    count: int
+    first_t: float
+    last_t: float
+    score: float
+    idle_count: int = 0
+    open_count: int = 0
+    toggle_count: int = 0
+    button_count: int = 0
+    near_event_count: int = 0
+    near_event_segments: int = 0
+    min_distance_ms: float = -1.0
+    changed_bits_vs_idle: int = 0
+    changed_bits_preview: str = ""
+    dynamic_bytes: str = ""
+    payloads_preview: str = ""
+
+    def data_hex(self) -> str:
+        return " ".join(f"{b:02X}" for b in self.data[: self.dlc])
+
+    def slcan(self) -> str:
+        if self.can_id > 0x7FF:
+            return f"T{self.can_id:08X}{self.dlc:X}" + "".join(f"{b:02X}" for b in self.data[: self.dlc])
+        return f"t{self.can_id:03X}{self.dlc:X}" + "".join(f"{b:02X}" for b in self.data[: self.dlc])
+
+    def as_row(self) -> Dict[str, object]:
+        return {
+            "event_id": self.event_id,
+            "mode": self.mode,
+            "kind": self.kind,
+            "source": self.source,
+            "reason": self.reason,
+            "bus": self.bus,
+            "id_hex": f"{self.can_id:X}",
+            "dlc": self.dlc,
+            "data_hex": self.data_hex(),
+            "slcan": self.slcan(),
+            "count": self.count,
+            "idle_count": self.idle_count,
+            "open_count": self.open_count,
+            "toggle_count": self.toggle_count,
+            "button_count": self.button_count,
+            "near_event_count": self.near_event_count,
+            "near_event_segments": self.near_event_segments,
+            "first_t": round(self.first_t, 6),
+            "last_t": round(self.last_t, 6),
+            "min_distance_ms": round(self.min_distance_ms, 3) if self.min_distance_ms >= 0 else "",
+            "score": round(self.score, 3),
+            "changed_bits_vs_idle": self.changed_bits_vs_idle,
+            "changed_bits_preview": self.changed_bits_preview,
+            "dynamic_bytes": self.dynamic_bytes,
+            "payloads_preview": self.payloads_preview,
+        }
+
+
+@dataclass
 class EventResult:
     vehicle: str
     event_id: int
@@ -528,6 +597,7 @@ class EventResult:
     validation_rejected: List[Dict[str, object]]
     dynamic_suspects: List[Dict[str, object]]
     dropped_dynamic_ids: List[Dict[str, object]]
+    command_frame_candidates: List[CommandFrameCandidate]
     warnings: List[str]
     alternate_variants: List[RuleVariant] = field(default_factory=list)
 
@@ -1006,6 +1076,508 @@ def annotate_candidates_with_dynamic_suspects(
         if c.suspect_reasons and c.suspect_reasons not in c.reason:
             c.reason = f"{c.reason}|suspect:{c.suspect_reasons}"
 
+
+
+
+PayloadSig = Tuple[int, int, int, Tuple[int, ...]]  # bus, can_id, dlc, payload
+
+
+def payload_sig(fr: Frame) -> PayloadSig:
+    data = tuple(fr.data[: min(fr.dlc, len(fr.data))])
+    return fr.bus, fr.can_id, fr.dlc, data
+
+
+def payload_stats(frames: Sequence[Frame]) -> Dict[PayloadSig, List[Frame]]:
+    out: DefaultDict[PayloadSig, List[Frame]] = defaultdict(list)
+    for fr in frames:
+        out[payload_sig(fr)].append(fr)
+    return dict(out)
+
+
+def payload_key(sig: PayloadSig) -> RuleKey:
+    bus, can_id, _dlc, _data = sig
+    return bus, can_id
+
+
+def frame_payload_hex(data: Sequence[int], dlc: int) -> str:
+    return " ".join(f"{b:02X}" for b in data[:dlc])
+
+
+def bit_diffs_between_payloads(a: Sequence[int], b: Sequence[int], max_dlc: int) -> List[str]:
+    n = min(max(len(a), len(b)), max_dlc)
+    out: List[str] = []
+    for by in range(n):
+        av = a[by] if by < len(a) else 0
+        bv = b[by] if by < len(b) else 0
+        x = av ^ bv
+        for bit in range(8):
+            if x & (1 << bit):
+                out.append(f"BY:{by}/BI:{bit}")
+    return out
+
+
+def best_payload_diff_vs_idle(
+    sig: PayloadSig,
+    idle_by_key: Dict[RuleKey, List[Frame]],
+    *,
+    max_dlc: int,
+    preview_limit: int,
+) -> Tuple[int, str]:
+    bus, can_id, dlc, data = sig
+    idle_frames = idle_by_key.get((bus, can_id), [])
+    if not idle_frames:
+        return -1, "id_absent_in_idle"
+
+    best: Optional[List[str]] = None
+    for fr in idle_frames:
+        diffs = bit_diffs_between_payloads(fr.data[:fr.dlc], data[:dlc], max_dlc=max_dlc)
+        if best is None or len(diffs) < len(best):
+            best = diffs
+            if not best:
+                break
+    if best is None:
+        return -1, "id_absent_in_idle"
+    return len(best), " ".join(best[:preview_limit])
+
+
+def dynamic_bytes_for_frame(
+    bus: int,
+    can_id: int,
+    dlc: int,
+    dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
+) -> str:
+    parts: List[str] = []
+    for by in range(dlc):
+        row = dynamic_by_byte.get((bus, can_id, by))
+        if row is None:
+            continue
+        reasons = str(row.get("reasons", ""))
+        source = str(row.get("source", ""))
+        counter = row.get("counter_kind", "")
+        label = reasons
+        if counter:
+            label = f"{label}/{counter}" if label else str(counter)
+        parts.append(f"BY:{by}:{label}@{source}")
+    return " | ".join(parts)
+
+
+def payloads_preview_for_key(frames: Sequence[Frame], key: RuleKey, limit: int = 4) -> str:
+    payloads = first_payloads([fr for fr in frames if (fr.bus, fr.can_id) == key], limit=limit)
+    return " | ".join(payloads)
+
+
+def command_candidate_from_sig(
+    *,
+    event_id: int,
+    mode: str,
+    kind: str,
+    source: str,
+    reason: str,
+    sig: PayloadSig,
+    frames: Sequence[Frame],
+    score: float,
+    idle_stats: Dict[PayloadSig, List[Frame]],
+    open_stats: Optional[Dict[PayloadSig, List[Frame]]] = None,
+    toggle_stats: Optional[Dict[PayloadSig, List[Frame]]] = None,
+    button_stats: Optional[Dict[PayloadSig, List[Frame]]] = None,
+    idle_by_key: Optional[Dict[RuleKey, List[Frame]]] = None,
+    dynamic_by_byte: Optional[Dict[Tuple[int, int, int], Dict[str, object]]] = None,
+    near_event_count: int = 0,
+    near_event_segments: int = 0,
+    min_distance_ms: float = -1.0,
+    payloads_preview: str = "",
+    args: Optional[argparse.Namespace] = None,
+) -> CommandFrameCandidate:
+    bus, can_id, dlc, data = sig
+    count = len(frames)
+    first_t = min((fr.t for fr in frames), default=0.0)
+    last_t = max((fr.t for fr in frames), default=0.0)
+    changed_count = 0
+    changed_preview = ""
+    if idle_by_key is not None and args is not None:
+        changed_count, changed_preview = best_payload_diff_vs_idle(
+            sig,
+            idle_by_key,
+            max_dlc=args.max_dlc,
+            preview_limit=args.command_changed_bits_preview,
+        )
+    return CommandFrameCandidate(
+        event_id=event_id,
+        mode=mode,
+        kind=kind,
+        source=source,
+        reason=reason,
+        bus=bus,
+        can_id=can_id,
+        dlc=dlc,
+        data=data,
+        count=count,
+        first_t=first_t,
+        last_t=last_t,
+        score=score,
+        idle_count=len(idle_stats.get(sig, [])),
+        open_count=len(open_stats.get(sig, [])) if open_stats is not None else 0,
+        toggle_count=len(toggle_stats.get(sig, [])) if toggle_stats is not None else 0,
+        button_count=len(button_stats.get(sig, [])) if button_stats is not None else 0,
+        near_event_count=near_event_count,
+        near_event_segments=near_event_segments,
+        min_distance_ms=min_distance_ms,
+        changed_bits_vs_idle=changed_count,
+        changed_bits_preview=changed_preview,
+        dynamic_bytes=dynamic_bytes_for_frame(bus, can_id, dlc, dynamic_by_byte or {}),
+        payloads_preview=payloads_preview,
+    )
+
+
+def rank_and_limit_command_candidates(
+    rows: Sequence[CommandFrameCandidate],
+    *,
+    args: argparse.Namespace,
+) -> List[CommandFrameCandidate]:
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            -r.score,
+            r.bus,
+            r.can_id,
+            r.source,
+            r.kind,
+            r.data,
+        ),
+    )
+    out: List[CommandFrameCandidate] = []
+    per_id: DefaultDict[RuleKey, int] = defaultdict(int)
+    seen: set[Tuple[str, str, PayloadSig]] = set()
+    for r in ordered:
+        sig = (r.bus, r.can_id, r.dlc, r.data)
+        dedup_key = (r.kind, r.source, sig)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        key = (r.bus, r.can_id)
+        if args.command_max_payloads_per_id > 0 and per_id[key] >= args.command_max_payloads_per_id:
+            continue
+        out.append(r)
+        per_id[key] += 1
+        if len(out) >= args.max_command_frame_candidates:
+            break
+    return out
+
+
+def simulate_firmware_rule_segments(
+    frames: Sequence[Frame],
+    candidates: Sequence[Candidate],
+    *,
+    initial_cache: Optional[Dict[RuleKey, Tuple[int, ...]]] = None,
+    ignore_not_ready: bool = False,
+) -> List[Tuple[float, float]]:
+    """Return active windows of the complete rule during a recording."""
+    if not candidates:
+        return []
+
+    cache: Dict[RuleKey, Tuple[int, ...]] = dict(initial_cache or {})
+    required_keys = {(c.bus, c.can_id) for c in candidates}
+    active_prev = False
+    active_start: Optional[float] = None
+    last_t: Optional[float] = None
+    segments: List[Tuple[float, float]] = []
+
+    for fr in sorted(frames, key=lambda x: x.t):
+        cache[(fr.bus, fr.can_id)] = tuple(fr.data[: fr.dlc])
+        last_t = fr.t
+        if ignore_not_ready and not required_keys.issubset(cache.keys()):
+            continue
+        active = evaluate_candidate_rule_from_cache(candidates, cache)
+        if active and not active_prev:
+            active_start = fr.t
+        elif not active and active_prev:
+            segments.append((active_start if active_start is not None else fr.t, fr.t))
+            active_start = None
+        active_prev = active
+
+    if active_prev and active_start is not None:
+        segments.append((active_start, last_t if last_t is not None else active_start))
+    return segments
+
+
+def near_segments_for_frames(
+    frames: Sequence[Frame],
+    segments: Sequence[Tuple[float, float]],
+    *,
+    window_ms: float,
+) -> Tuple[int, int, float]:
+    if not frames or not segments:
+        return 0, 0, -1.0
+    window_s = max(0.0, window_ms) / 1000.0
+    near_count = 0
+    near_segment_ids: set[int] = set()
+    min_dist_s: Optional[float] = None
+
+    for fr in frames:
+        best_dist_for_frame: Optional[float] = None
+        best_idx_for_frame: Optional[int] = None
+        for idx, (start, end) in enumerate(segments):
+            if start <= fr.t <= end:
+                dist = 0.0
+            elif fr.t < start:
+                dist = start - fr.t
+            else:
+                dist = fr.t - end
+            if best_dist_for_frame is None or dist < best_dist_for_frame:
+                best_dist_for_frame = dist
+                best_idx_for_frame = idx
+            if min_dist_s is None or dist < min_dist_s:
+                min_dist_s = dist
+        if best_dist_for_frame is not None and best_dist_for_frame <= window_s:
+            near_count += 1
+            if best_idx_for_frame is not None:
+                near_segment_ids.add(best_idx_for_frame)
+
+    return near_count, len(near_segment_ids), (min_dist_s * 1000.0 if min_dist_s is not None else -1.0)
+
+
+def top_payload_sigs_for_key(
+    stats: Dict[PayloadSig, List[Frame]],
+    key: RuleKey,
+    limit: int,
+) -> List[Tuple[PayloadSig, List[Frame]]]:
+    rows = [(sig, flist) for sig, flist in stats.items() if payload_key(sig) == key]
+    rows.sort(key=lambda item: (-len(item[1]), item[0][2], item[0][3]))
+    return rows[: max(0, limit)]
+
+
+def build_state_command_frame_candidates(
+    *,
+    event_id: int,
+    idle_frames: Sequence[Frame],
+    open_frames: Sequence[Frame],
+    toggle_frames: Sequence[Frame],
+    selected_candidates: Sequence[Candidate],
+    dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
+    args: argparse.Namespace,
+) -> List[CommandFrameCandidate]:
+    if not args.command_frame_candidates:
+        return []
+
+    idle_by_key = group_frames(idle_frames)
+    idle_stats = payload_stats(idle_frames)
+    open_stats = payload_stats(open_frames)
+    toggle_stats = payload_stats(toggle_frames)
+    idle_sigs = set(idle_stats)
+    open_sigs = set(open_stats)
+    selected_keys = {(c.bus, c.can_id) for c in selected_candidates}
+    rows: List[CommandFrameCandidate] = []
+
+    for sig, flist in open_stats.items():
+        key = payload_key(sig)
+        reasons: List[str] = []
+        score = 0.0
+        kind = "state_payload"
+        if key not in idle_by_key:
+            reasons.append("id_absent_in_idle_present_in_open")
+            score += 1500.0
+        if sig not in idle_sigs:
+            reasons.append("payload_absent_in_idle_present_in_open")
+            score += 1000.0
+        if key in selected_keys:
+            reasons.append("selected_rule_id_open_payload")
+            score += 500.0
+        if not reasons:
+            continue
+        score += min(len(flist), 200) * 2.0
+        rows.append(
+            command_candidate_from_sig(
+                event_id=event_id,
+                mode="state",
+                kind=kind,
+                source="open",
+                reason="|".join(reasons),
+                sig=sig,
+                frames=flist,
+                score=score,
+                idle_stats=idle_stats,
+                open_stats=open_stats,
+                toggle_stats=toggle_stats,
+                idle_by_key=idle_by_key,
+                dynamic_by_byte=dynamic_by_byte,
+                payloads_preview=payloads_preview_for_key(open_frames, key),
+                args=args,
+            )
+        )
+
+    for sig, flist in toggle_stats.items():
+        key = payload_key(sig)
+        reasons: List[str] = []
+        score = 0.0
+        if sig not in idle_sigs:
+            reasons.append("payload_absent_in_idle_present_in_toggle")
+            score += 700.0
+        if sig in open_sigs:
+            reasons.append("toggle_payload_also_seen_in_open")
+            score += 500.0
+        if key in selected_keys:
+            reasons.append("selected_rule_id_toggle_payload")
+            score += 300.0
+        if not reasons:
+            continue
+        score += min(len(flist), 200)
+        rows.append(
+            command_candidate_from_sig(
+                event_id=event_id,
+                mode="state",
+                kind="state_toggle_payload",
+                source="toggle",
+                reason="|".join(reasons),
+                sig=sig,
+                frames=flist,
+                score=score,
+                idle_stats=idle_stats,
+                open_stats=open_stats,
+                toggle_stats=toggle_stats,
+                idle_by_key=idle_by_key,
+                dynamic_by_byte=dynamic_by_byte,
+                payloads_preview=payloads_preview_for_key(toggle_frames, key),
+                args=args,
+            )
+        )
+
+    # Always expose representative full frames for IDs used by the selected bit rule.
+    # These are useful when the bit rule is correct, but server-side/full-frame matching
+    # might need the complete payload including counter/CRC bytes.
+    for key in selected_keys:
+        for source_name, source_frames, stats, base_score in (
+            ("open", open_frames, open_stats, 650.0),
+            ("toggle", toggle_frames, toggle_stats, 450.0),
+        ):
+            for sig, flist in top_payload_sigs_for_key(stats, key, args.command_max_payloads_per_rule_id):
+                rows.append(
+                    command_candidate_from_sig(
+                        event_id=event_id,
+                        mode="state",
+                        kind="selected_rule_id_full_payload",
+                        source=source_name,
+                        reason="full_payload_from_id_used_by_bit_rule",
+                        sig=sig,
+                        frames=flist,
+                        score=base_score + min(len(flist), 100),
+                        idle_stats=idle_stats,
+                        open_stats=open_stats,
+                        toggle_stats=toggle_stats,
+                        idle_by_key=idle_by_key,
+                        dynamic_by_byte=dynamic_by_byte,
+                        payloads_preview=payloads_preview_for_key(source_frames, key),
+                        args=args,
+                    )
+                )
+
+    return rank_and_limit_command_candidates(rows, args=args)
+
+
+def build_button_command_frame_candidates(
+    *,
+    event_id: int,
+    idle_frames: Sequence[Frame],
+    button_frames: Sequence[Frame],
+    selected_candidates: Sequence[Candidate],
+    dynamic_by_byte: Dict[Tuple[int, int, int], Dict[str, object]],
+    args: argparse.Namespace,
+) -> List[CommandFrameCandidate]:
+    if not args.command_frame_candidates:
+        return []
+
+    idle_by_key = group_frames(idle_frames)
+    idle_stats = payload_stats(idle_frames)
+    button_stats = payload_stats(button_frames)
+    idle_sigs = set(idle_stats)
+    selected_keys = {(c.bus, c.can_id) for c in selected_candidates}
+    idle_cache = frame_cache_after(idle_frames)
+    segments = simulate_firmware_rule_segments(
+        button_frames,
+        selected_candidates,
+        initial_cache=idle_cache,
+        ignore_not_ready=args.firmware_ignore_not_ready,
+    )
+
+    rows: List[CommandFrameCandidate] = []
+    for sig, flist in button_stats.items():
+        key = payload_key(sig)
+        near_count, near_segments, min_dist_ms = near_segments_for_frames(
+            flist,
+            segments,
+            window_ms=args.command_button_window_ms,
+        )
+        reasons: List[str] = []
+        score = 0.0
+        if key not in idle_by_key:
+            reasons.append("id_absent_in_idle_present_in_button")
+            score += 1500.0
+        if sig not in idle_sigs:
+            reasons.append("payload_absent_in_idle_present_in_button")
+            score += 1000.0
+        if near_count > 0:
+            reasons.append("near_button_press_window")
+            score += 900.0 + near_segments * 100.0 + near_count * 10.0
+        if key in selected_keys:
+            reasons.append("selected_rule_id_button_payload")
+            score += 400.0
+
+        if not reasons:
+            continue
+        if near_count <= 0 and sig in idle_sigs and key not in selected_keys:
+            continue
+        if near_count > 0 and sig in idle_sigs and not args.command_include_context_frames and key not in selected_keys:
+            continue
+
+        rows.append(
+            command_candidate_from_sig(
+                event_id=event_id,
+                mode="button",
+                kind="button_command_payload" if near_count > 0 else "button_payload",
+                source="button",
+                reason="|".join(reasons),
+                sig=sig,
+                frames=flist,
+                score=score + min(len(flist), 200),
+                idle_stats=idle_stats,
+                button_stats=button_stats,
+                idle_by_key=idle_by_key,
+                dynamic_by_byte=dynamic_by_byte,
+                near_event_count=near_count,
+                near_event_segments=near_segments,
+                min_distance_ms=min_dist_ms,
+                payloads_preview=payloads_preview_for_key(button_frames, key),
+                args=args,
+            )
+        )
+
+    # If no bit rule was found, still expose payloads that are absent from idle. They may be
+    # full command frames with counter/CRC bytes where per-bit state extraction is not enough.
+    if not selected_candidates:
+        for sig, flist in button_stats.items():
+            if sig in idle_sigs:
+                continue
+            key = payload_key(sig)
+            rows.append(
+                command_candidate_from_sig(
+                    event_id=event_id,
+                    mode="button",
+                    kind="button_payload_no_bit_rule",
+                    source="button",
+                    reason="payload_absent_in_idle_no_bit_rule_available",
+                    sig=sig,
+                    frames=flist,
+                    score=800.0 + min(len(flist), 200),
+                    idle_stats=idle_stats,
+                    button_stats=button_stats,
+                    idle_by_key=idle_by_key,
+                    dynamic_by_byte=dynamic_by_byte,
+                    min_distance_ms=-1.0,
+                    payloads_preview=payloads_preview_for_key(button_frames, key),
+                    args=args,
+                )
+            )
+
+    return rank_and_limit_command_candidates(rows, args=args)
 
 def apply_busy_filter(
     candidates: List[Candidate],
@@ -1508,6 +2080,16 @@ def analyze_state_event(
         alternate_variants.append(idle_only_variant)
         warnings.append(f"created idle_ids_only variant: {note}")
 
+    command_frame_candidates = build_state_command_frame_candidates(
+        event_id=event_id,
+        idle_frames=idle_frames,
+        open_frames=open_frames,
+        toggle_frames=toggle_frames,
+        selected_candidates=default_variant.candidates,
+        dynamic_by_byte=dynamic_by_byte,
+        args=args,
+    )
+
     return EventResult(
         vehicle=vehicle,
         event_id=event_id,
@@ -1520,6 +2102,7 @@ def analyze_state_event(
         validation_rejected=default_variant.validation_rejected,
         dynamic_suspects=dynamic_suspects,
         dropped_dynamic_ids=dropped_dynamic_ids,
+        command_frame_candidates=command_frame_candidates,
         warnings=warnings,
         alternate_variants=alternate_variants,
     )
@@ -1636,6 +2219,15 @@ def analyze_button_event(
     validation_rejected = (validation_rejected + firmware_rejected)[: args.max_validation_rejected]
     rule_line = candidates_rule_line(event_id, candidates, args.bit_order)
 
+    command_frame_candidates = build_button_command_frame_candidates(
+        event_id=event_id,
+        idle_frames=idle_frames,
+        button_frames=button_frames,
+        selected_candidates=candidates,
+        dynamic_by_byte=dynamic_by_byte,
+        args=args,
+    )
+
     return EventResult(
         vehicle=vehicle,
         event_id=event_id,
@@ -1648,6 +2240,7 @@ def analyze_button_event(
         validation_rejected=validation_rejected,
         dynamic_suspects=dynamic_suspects,
         dropped_dynamic_ids=dropped_dynamic_ids,
+        command_frame_candidates=command_frame_candidates,
         warnings=warnings,
     )
 
@@ -1677,6 +2270,37 @@ def discover_event_dirs(root: Path) -> List[Tuple[str, int, Path]]:
             out.append((vehicle_dir.name, int(event_dir.name), event_dir))
     return out
 
+
+
+
+def command_frame_fieldnames() -> List[str]:
+    return [
+        "event_id",
+        "mode",
+        "kind",
+        "source",
+        "reason",
+        "bus",
+        "id_hex",
+        "dlc",
+        "data_hex",
+        "slcan",
+        "count",
+        "idle_count",
+        "open_count",
+        "toggle_count",
+        "button_count",
+        "near_event_count",
+        "near_event_segments",
+        "first_t",
+        "last_t",
+        "min_distance_ms",
+        "score",
+        "changed_bits_vs_idle",
+        "changed_bits_preview",
+        "dynamic_bytes",
+        "payloads_preview",
+    ]
 
 def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> None:
     vehicle_dir = out_dir / result.vehicle
@@ -1721,6 +2345,13 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
             for c in v.candidates:
                 writer.writerow(c.as_row(bit_order))
 
+    command_base = vehicle_dir / f"{result.event_id}_{result.mode}_command_frames"
+    with (command_base.with_suffix(".csv")).open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=command_frame_fieldnames())
+        writer.writeheader()
+        for c in result.command_frame_candidates:
+            writer.writerow(c.as_row())
+
     with (base.with_suffix(".json")).open("w", encoding="utf-8") as f:
         json.dump(
             {
@@ -1736,6 +2367,7 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
                 "validation_rejected": result.validation_rejected,
                 "dynamic_suspects": result.dynamic_suspects,
                 "dropped_dynamic_ids": result.dropped_dynamic_ids,
+                "command_frame_candidates": [c.as_row() for c in result.command_frame_candidates],
                 "alternate_variants": [
                     {
                         "name": v.name,
@@ -1836,6 +2468,7 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                 "candidate_count",
                 "suspect_candidates",
                 "dynamic_suspects",
+                "command_frame_candidates",
                 "dropped_result_frames",
                 "dropped_dynamic_ids",
                 "validation_rejected",
@@ -1856,6 +2489,7 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                         "candidate_count": len(r.candidates),
                         "suspect_candidates": sum(1 for c in r.candidates if c.suspect),
                         "dynamic_suspects": len(r.dynamic_suspects),
+                        "command_frame_candidates": len(r.command_frame_candidates),
                         "dropped_result_frames": len(r.dropped_busy_frames),
                         "dropped_dynamic_ids": len(r.dropped_dynamic_ids),
                         "validation_rejected": len(r.validation_rejected),
@@ -1892,6 +2526,16 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                     out_row = dict(row)
                     out_row["event_id"] = r.event_id
                     out_row["mode"] = r.mode
+                    writer.writerow(out_row)
+
+        with (vehicle_dir / "command_frame_candidates.csv").open("w", newline="", encoding="utf-8") as f:
+            fieldnames = ["vehicle"] + command_frame_fieldnames()
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for r in items:
+                for c in r.command_frame_candidates:
+                    out_row = c.as_row()
+                    out_row["vehicle"] = r.vehicle
                     writer.writerow(out_row)
 
         with (vehicle_dir / "dropped_dynamic_ids.csv").open("w", newline="", encoding="utf-8") as f:
@@ -2069,6 +2713,54 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
             "because firmware itself treats missing cache as rule=false."
         ),
     )
+    p.add_argument(
+        "--command-frame-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Export separate full-payload command/state frame candidates. These rows are diagnostic "
+            "and are not included in scan_data.txt. Enabled by default."
+        ),
+    )
+    p.add_argument(
+        "--max-command-frame-candidates",
+        type=int,
+        default=300,
+        help="Max command-frame candidate rows to store per event.",
+    )
+    p.add_argument(
+        "--command-max-payloads-per-id",
+        type=int,
+        default=8,
+        help="Max command-frame candidate payload rows kept per CAN ID after ranking. Use 0 for unlimited.",
+    )
+    p.add_argument(
+        "--command-max-payloads-per-rule-id",
+        type=int,
+        default=6,
+        help="For CAN IDs already used by a bit rule, export up to this many representative full payloads.",
+    )
+    p.add_argument(
+        "--command-button-window-ms",
+        type=float,
+        default=250.0,
+        help="Button mode: consider frames within this time window around detected press segments as command candidates.",
+    )
+    p.add_argument(
+        "--command-include-context-frames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Button mode: include repeated context frames near a press even if the exact payload was also present in idle. "
+            "Disable to keep only payloads absent from idle or IDs used by the selected bit rule."
+        ),
+    )
+    p.add_argument(
+        "--command-changed-bits-preview",
+        type=int,
+        default=24,
+        help="How many bit differences vs the closest idle payload to preview in command-frame CSV/JSON.",
+    )
     p.add_argument("--expected-presses", type=int, default=3, help="Button mode expects exactly this many complete press-release cycles")
     p.add_argument("--allow-unreleased-last-press", action="store_true", help="Button mode: allow the recording to end while the last press is still active")
     p.add_argument("--include-event-only", action="store_true", help="Include frames absent in idle as rules, not only debug suggestions")
@@ -2107,13 +2799,13 @@ def print_summary(results: List[EventResult]) -> None:
         print("No events analyzed")
         return
     print("\nSummary:")
-    print(f"{'vehicle':12} {'event':>5} {'mode':20} {'rules':>5} {'susp':>5} {'dyn':>5} {'drop_fr':>7} {'reject':>7}  rule")
+    print(f"{'vehicle':12} {'event':>5} {'mode':20} {'rules':>5} {'susp':>5} {'dyn':>5} {'cmd':>5} {'drop_fr':>7} {'reject':>7}  rule")
     print("-" * 136)
     for r in sorted(results, key=lambda x: (x.vehicle, x.event_id)):
-        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:20} {len(r.candidates):5d} {sum(1 for c in r.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
+        print(f"{r.vehicle:12} {r.event_id:5d} {r.mode:20} {len(r.candidates):5d} {sum(1 for c in r.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(r.command_frame_candidates):5d} {len(r.dropped_busy_frames):7d} {len(r.validation_rejected):7d}  {r.rule_line}")
         for v in r.alternate_variants:
             mode_name = f"{r.mode}/{v.name}"
-            print(f"{r.vehicle:12} {r.event_id:5d} {mode_name:20} {len(v.candidates):5d} {sum(1 for c in v.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {len(v.dropped_busy_frames):7d} {len(v.validation_rejected):7d}  {v.rule_line}")
+            print(f"{r.vehicle:12} {r.event_id:5d} {mode_name:20} {len(v.candidates):5d} {sum(1 for c in v.candidates if c.suspect):5d} {len(r.dynamic_suspects):5d} {'':>5} {len(v.dropped_busy_frames):7d} {len(v.validation_rejected):7d}  {v.rule_line}")
             if v.note:
                 print(f"  NOTE: {v.note}")
         for w in r.warnings:
