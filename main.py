@@ -30,6 +30,9 @@ each bit looks correct separately but the full rule never becomes active.
 It also exports separate command-frame candidates. These are full CAN payloads that
 look useful for command/state analysis, even when they contain counters or CRC bytes.
 They are diagnostic outputs only and are not mixed into firmware bit rules.
+
+For button command candidates, the best CSV also contains `button_press_frames`,
+which previews one concrete full CAN frame near each detected press segment.
 """
 
 from __future__ import annotations
@@ -540,6 +543,8 @@ class CommandFrameCandidate:
     button_count: int = 0
     near_event_count: int = 0
     near_event_segments: int = 0
+    button_press_frame_count: int = 0
+    button_press_frames: str = ""
     min_distance_ms: float = -1.0
     changed_bits_vs_idle: int = 0
     changed_bits_preview: str = ""
@@ -573,6 +578,8 @@ class CommandFrameCandidate:
             "button_count": self.button_count,
             "near_event_count": self.near_event_count,
             "near_event_segments": self.near_event_segments,
+            "button_press_frame_count": self.button_press_frame_count,
+            "button_press_frames": self.button_press_frames,
             "first_t": round(self.first_t, 6),
             "last_t": round(self.last_t, 6),
             "min_distance_ms": round(self.min_distance_ms, 3) if self.min_distance_ms >= 0 else "",
@@ -1184,6 +1191,8 @@ def command_candidate_from_sig(
     dynamic_by_byte: Optional[Dict[Tuple[int, int, int], Dict[str, object]]] = None,
     near_event_count: int = 0,
     near_event_segments: int = 0,
+    button_press_frame_count: int = 0,
+    button_press_frames: str = "",
     min_distance_ms: float = -1.0,
     payloads_preview: str = "",
     args: Optional[argparse.Namespace] = None,
@@ -1221,6 +1230,8 @@ def command_candidate_from_sig(
         button_count=len(button_stats.get(sig, [])) if button_stats is not None else 0,
         near_event_count=near_event_count,
         near_event_segments=near_event_segments,
+        button_press_frame_count=button_press_frame_count,
+        button_press_frames=button_press_frames,
         min_distance_ms=min_distance_ms,
         changed_bits_vs_idle=changed_count,
         changed_bits_preview=changed_preview,
@@ -1334,6 +1345,75 @@ def near_segments_for_frames(
                 near_segment_ids.add(best_idx_for_frame)
 
     return near_count, len(near_segment_ids), (min_dist_s * 1000.0 if min_dist_s is not None else -1.0)
+
+
+
+def frame_to_slcan_text(fr: Frame) -> str:
+    data_hex = "".join(f"{b:02X}" for b in fr.data[: fr.dlc])
+    if fr.can_id > 0x7FF:
+        return f"T{fr.can_id:08X}{fr.dlc:X}{data_hex}"
+    return f"t{fr.can_id:03X}{fr.dlc:X}{data_hex}"
+
+
+def _distance_to_segment(t: float, segment: Tuple[float, float]) -> float:
+    start, end = segment
+    if start <= t <= end:
+        return 0.0
+    if t < start:
+        return start - t
+    return t - end
+
+
+def button_press_frame_preview(
+    frames: Sequence[Frame],
+    segments: Sequence[Tuple[float, float]],
+    *,
+    window_ms: float,
+    max_segments: int = 10,
+) -> Tuple[int, str]:
+    """Return one representative full payload frame near every detected button press.
+
+    `near_event_count` tells how many occurrences of the same payload were close to
+    press windows, but it does not show the actual frame. This preview makes the
+    best CSV easier to inspect: P1/P2/P3 show the concrete CAN frame selected for
+    each detected press segment.
+    """
+    if not frames or not segments:
+        return 0, ""
+
+    window_s = max(0.0, window_ms) / 1000.0
+    parts: List[str] = []
+    matched = 0
+
+    for idx, segment in enumerate(segments[: max(0, max_segments)], start=1):
+        best_fr: Optional[Frame] = None
+        best_dist: Optional[float] = None
+
+        for fr in frames:
+            dist = _distance_to_segment(fr.t, segment)
+            if dist > window_s:
+                continue
+            if best_dist is None or dist < best_dist or (dist == best_dist and fr.t < (best_fr.t if best_fr else fr.t)):
+                best_dist = dist
+                best_fr = fr
+
+        if best_fr is None:
+            continue
+
+        matched += 1
+        offset_ms = 0.0
+        start, end = segment
+        if best_fr.t < start:
+            offset_ms = (best_fr.t - start) * 1000.0
+        elif best_fr.t > end:
+            offset_ms = (best_fr.t - end) * 1000.0
+        else:
+            offset_ms = 0.0
+        parts.append(
+            f"P{idx}:t={best_fr.t:.6f}s,dt={offset_ms:+.1f}ms,{frame_to_slcan_text(best_fr)}"
+        )
+
+    return matched, " | ".join(parts)
 
 
 def top_payload_sigs_for_key(
@@ -1506,6 +1586,12 @@ def build_button_command_frame_candidates(
             segments,
             window_ms=args.command_button_window_ms,
         )
+        press_frame_count, press_frames = button_press_frame_preview(
+            flist,
+            segments,
+            window_ms=args.command_button_window_ms,
+            max_segments=max(args.expected_presses, args.command_button_min_near_segments, 10),
+        )
         reasons: List[str] = []
         score = 0.0
         if key not in idle_by_key:
@@ -1544,6 +1630,8 @@ def build_button_command_frame_candidates(
                 dynamic_by_byte=dynamic_by_byte,
                 near_event_count=near_count,
                 near_event_segments=near_segments,
+                button_press_frame_count=press_frame_count,
+                button_press_frames=press_frames,
                 min_distance_ms=min_dist_ms,
                 payloads_preview=payloads_preview_for_key(button_frames, key),
                 args=args,
@@ -2292,6 +2380,8 @@ def command_frame_fieldnames() -> List[str]:
         "button_count",
         "near_event_count",
         "near_event_segments",
+        "button_press_frame_count",
+        "button_press_frames",
         "first_t",
         "last_t",
         "min_distance_ms",
@@ -2388,7 +2478,214 @@ def write_event_outputs(result: EventResult, out_dir: Path, bit_order: str) -> N
         )
 
 
-def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order: str) -> None:
+
+
+def command_frame_best_fieldnames() -> List[str]:
+    return [
+        "vehicle",
+        "event_id",
+        "mode",
+        "command_rank",
+        "best_score",
+        "best_status",
+        "reject_reason",
+        "near_ratio",
+        "payload_event_count",
+        "id_event_count",
+    ] + command_frame_fieldnames()
+
+
+def _command_payload_identity(vehicle: str, c: CommandFrameCandidate) -> Tuple[str, str, int, int, int, Tuple[int, ...]]:
+    # Keep state/button separated: the same payload may be a normal state in one mode
+    # and only context in another. Vehicle is included because roots may contain several cars.
+    return (vehicle, c.mode, c.bus, c.can_id, c.dlc, c.data)
+
+
+def _command_id_identity(vehicle: str, c: CommandFrameCandidate) -> Tuple[str, str, int, int]:
+    return (vehicle, c.mode, c.bus, c.can_id)
+
+
+def _unique_event_counts_for_commands(
+    results: Sequence[EventResult],
+) -> Tuple[Dict[Tuple[str, str, int, int, int, Tuple[int, ...]], int], Dict[Tuple[str, str, int, int], int]]:
+    payload_events: DefaultDict[Tuple[str, str, int, int, int, Tuple[int, ...]], set[int]] = defaultdict(set)
+    id_events: DefaultDict[Tuple[str, str, int, int], set[int]] = defaultdict(set)
+    for r in results:
+        for c in r.command_frame_candidates:
+            payload_events[_command_payload_identity(r.vehicle, c)].add(r.event_id)
+            id_events[_command_id_identity(r.vehicle, c)].add(r.event_id)
+    return ({k: len(v) for k, v in payload_events.items()}, {k: len(v) for k, v in id_events.items()})
+
+
+def _reason_has(c: CommandFrameCandidate, text: str) -> bool:
+    return text in (c.reason or "")
+
+
+def command_best_score_and_status(
+    *,
+    vehicle: str,
+    c: CommandFrameCandidate,
+    payload_event_count: int,
+    id_event_count: int,
+    args: argparse.Namespace,
+) -> Tuple[float, str, str, float]:
+    """Score and optionally reject a full-payload command candidate for the best-list.
+
+    The raw command_frame_candidates.csv intentionally stays broad. This function builds
+    a practical shortlist:
+      * button: payload must be concentrated near detected press windows;
+      * state: payload should be absent in idle and preferably unique to the event.
+    """
+    near_ratio = (c.near_event_count / c.count) if c.count > 0 else 0.0
+    status = "keep"
+    reject: List[str] = []
+    score = float(c.score)
+
+    if c.mode == "button":
+        min_segments = args.command_button_min_near_segments
+        if min_segments <= 0:
+            min_segments = args.expected_presses
+
+        # Strong positive signals for a real short command frame.
+        score = 0.0
+        if _reason_has(c, "payload_absent_in_idle_present_in_button"):
+            score += 1200.0
+        if _reason_has(c, "id_absent_in_idle_present_in_button"):
+            score += 900.0
+        if _reason_has(c, "near_button_press_window"):
+            score += 700.0
+        if _reason_has(c, "selected_rule_id_button_payload"):
+            score += 250.0
+        score += min(c.near_event_segments, max(min_segments, 1)) * 250.0
+        score += min(c.button_press_frame_count, max(min_segments, 1)) * 180.0
+        score += min(c.near_event_count, 30) * 30.0
+        score += min(near_ratio, 1.0) * 600.0
+        score += min(c.changed_bits_vs_idle if c.changed_bits_vs_idle > 0 else 0, 64) * 2.0
+
+        # Penalties for context/background payloads.
+        score -= max(0, c.count - c.near_event_count) * args.command_button_outside_near_penalty
+        score -= max(0, payload_event_count - 1) * args.command_common_payload_penalty
+        score -= max(0, id_event_count - 1) * args.command_common_id_penalty
+        if c.dynamic_bytes:
+            score -= args.command_dynamic_byte_penalty
+
+        if c.idle_count > args.command_best_max_idle_count:
+            reject.append("seen_in_idle")
+        if c.near_event_segments < min_segments:
+            reject.append(f"near_segments_lt_{min_segments}")
+        if near_ratio < args.command_button_min_near_ratio:
+            reject.append("near_ratio_too_low")
+        if args.command_button_max_count > 0 and c.count > args.command_button_max_count and near_ratio < args.command_button_large_count_allow_near_ratio:
+            reject.append("count_too_large_for_near_ratio")
+
+    else:  # state
+        score = 0.0
+        if _reason_has(c, "selected_rule_id_open_payload") or _reason_has(c, "selected_rule_id_toggle_payload") or _reason_has(c, "full_payload_from_id_used_by_bit_rule"):
+            score += 900.0
+        if _reason_has(c, "payload_absent_in_idle_present_in_open"):
+            score += 900.0
+        if _reason_has(c, "id_absent_in_idle_present_in_open"):
+            score += 600.0
+        if _reason_has(c, "toggle_payload_also_seen_in_open"):
+            score += 600.0
+        if c.open_count > 0:
+            score += min(c.open_count, 200) * 2.0
+        if c.toggle_count > 0:
+            score += min(c.toggle_count, 200) * 1.5
+        score += min(c.changed_bits_vs_idle if c.changed_bits_vs_idle > 0 else 0, 64) * 2.0
+
+        # For states, high count is not bad by itself. Common payload across many
+        # different events is much more suspicious than high count in one active state.
+        score -= max(0, payload_event_count - 1) * args.command_common_payload_penalty
+        score -= max(0, id_event_count - 1) * args.command_common_id_penalty
+        if c.dynamic_bytes:
+            score -= args.command_dynamic_byte_penalty
+
+        if c.idle_count > args.command_best_max_idle_count:
+            reject.append("seen_in_idle")
+        if c.open_count <= 0:
+            reject.append("missing_in_open")
+        if args.command_state_require_toggle_seen and c.toggle_count <= 0:
+            reject.append("missing_in_toggle")
+        if args.command_state_max_payload_events > 0 and payload_event_count > args.command_state_max_payload_events:
+            reject.append("payload_seen_in_many_events")
+
+    if reject:
+        status = "reject"
+    return score, status, ";".join(reject), near_ratio
+
+
+def build_best_command_frame_rows(
+    results: Sequence[EventResult],
+    *,
+    args: argparse.Namespace,
+) -> List[Dict[str, object]]:
+    payload_counts, id_counts = _unique_event_counts_for_commands(results)
+    rows: List[Dict[str, object]] = []
+
+    for r in results:
+        for c in r.command_frame_candidates:
+            payload_event_count = payload_counts.get(_command_payload_identity(r.vehicle, c), 1)
+            id_event_count = id_counts.get(_command_id_identity(r.vehicle, c), 1)
+            best_score, status, reject_reason, near_ratio = command_best_score_and_status(
+                vehicle=r.vehicle,
+                c=c,
+                payload_event_count=payload_event_count,
+                id_event_count=id_event_count,
+                args=args,
+            )
+            out_row = c.as_row()
+            out_row.update(
+                {
+                    "vehicle": r.vehicle,
+                    "command_rank": 0,
+                    "best_score": round(best_score, 3),
+                    "best_status": status,
+                    "reject_reason": reject_reason,
+                    "near_ratio": round(near_ratio, 4),
+                    "payload_event_count": payload_event_count,
+                    "id_event_count": id_event_count,
+                }
+            )
+            rows.append(out_row)
+
+    rows.sort(
+        key=lambda row: (
+            row["vehicle"],
+            int(row["event_id"]),
+            str(row["mode"]),
+            1 if row["best_status"] == "reject" else 0,
+            -float(row["best_score"]),
+            int(row["bus"]),
+            int(str(row["id_hex"]), 16),
+            str(row["data_hex"]),
+        )
+    )
+
+    # Rank inside every event/mode, after filtering order.
+    current_key: Optional[Tuple[str, int, str]] = None
+    rank = 0
+    kept_per_event: DefaultDict[Tuple[str, int, str], int] = defaultdict(int)
+    final_rows: List[Dict[str, object]] = []
+    for row in rows:
+        key = (str(row["vehicle"]), int(row["event_id"]), str(row["mode"]))
+        if key != current_key:
+            current_key = key
+            rank = 0
+        rank += 1
+        row["command_rank"] = rank
+
+        if row["best_status"] == "reject" and not args.command_best_include_rejected:
+            continue
+        if row["best_status"] != "reject":
+            kept_per_event[key] += 1
+            if args.command_best_max_per_event > 0 and kept_per_event[key] > args.command_best_max_per_event:
+                continue
+        final_rows.append(row)
+
+    return final_rows
+
+def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order: str, args: argparse.Namespace) -> None:
     by_vehicle: DefaultDict[str, List[EventResult]] = defaultdict(list)
     for r in results:
         by_vehicle[r.vehicle].append(r)
@@ -2537,6 +2834,15 @@ def write_combined_outputs(results: List[EventResult], out_dir: Path, bit_order:
                     out_row = c.as_row()
                     out_row["vehicle"] = r.vehicle
                     writer.writerow(out_row)
+
+        # Practical shortlist: the raw file above keeps all candidates; this file ranks
+        # and filters them using button near-ratio and state cross-event uniqueness.
+        with (vehicle_dir / "command_frame_candidates_best.csv").open("w", newline="", encoding="utf-8") as f:
+            fieldnames = command_frame_best_fieldnames()
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in build_best_command_frame_rows(items, args=args):
+                writer.writerow(row)
 
         with (vehicle_dir / "dropped_dynamic_ids.csv").open("w", newline="", encoding="utf-8") as f:
             fieldnames = [
@@ -2761,6 +3067,87 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
         default=24,
         help="How many bit differences vs the closest idle payload to preview in command-frame CSV/JSON.",
     )
+    p.add_argument(
+        "--command-best-max-per-event",
+        type=int,
+        default=8,
+        help="Max kept rows per event in command_frame_candidates_best.csv. Use 0 for unlimited.",
+    )
+    p.add_argument(
+        "--command-best-include-rejected",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Also include rejected rows in command_frame_candidates_best.csv with reject_reason filled.",
+    )
+    p.add_argument(
+        "--command-best-max-idle-count",
+        type=int,
+        default=0,
+        help="Best-list filter: allow at most this many occurrences of the exact payload in idle.",
+    )
+    p.add_argument(
+        "--command-button-min-near-ratio",
+        type=float,
+        default=0.55,
+        help="Button best-list filter: near_event_count / count must be at least this value.",
+    )
+    p.add_argument(
+        "--command-button-min-near-segments",
+        type=int,
+        default=0,
+        help="Button best-list filter: min press segments covered. 0 means use --expected-presses.",
+    )
+    p.add_argument(
+        "--command-button-max-count",
+        type=int,
+        default=0,
+        help=(
+            "Optional hard-ish button count filter for best-list. If >0, rows above this count are rejected "
+            "unless near_ratio is at least --command-button-large-count-allow-near-ratio."
+        ),
+    )
+    p.add_argument(
+        "--command-button-large-count-allow-near-ratio",
+        type=float,
+        default=0.90,
+        help="Button best-list: allow high-count rows only when most occurrences are near presses.",
+    )
+    p.add_argument(
+        "--command-button-outside-near-penalty",
+        type=float,
+        default=12.0,
+        help="Button best-list score penalty per occurrence outside detected press windows.",
+    )
+    p.add_argument(
+        "--command-state-max-payload-events",
+        type=int,
+        default=1,
+        help="State best-list filter: reject exact payloads seen in more than this many events. Use 0 to disable.",
+    )
+    p.add_argument(
+        "--command-state-require-toggle-seen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="State best-list filter: require the exact payload to also appear in toggle.trc.",
+    )
+    p.add_argument(
+        "--command-common-payload-penalty",
+        type=float,
+        default=450.0,
+        help="Best-list score penalty when the exact payload appears as a candidate in multiple events.",
+    )
+    p.add_argument(
+        "--command-common-id-penalty",
+        type=float,
+        default=40.0,
+        help="Best-list score penalty when the CAN ID appears as a candidate in multiple events.",
+    )
+    p.add_argument(
+        "--command-dynamic-byte-penalty",
+        type=float,
+        default=80.0,
+        help="Best-list score penalty if the payload contains bytes marked counter/checksum/dynamic.",
+    )
     p.add_argument("--expected-presses", type=int, default=3, help="Button mode expects exactly this many complete press-release cycles")
     p.add_argument("--allow-unreleased-last-press", action="store_true", help="Button mode: allow the recording to end while the last press is still active")
     p.add_argument("--include-event-only", action="store_true", help="Include frames absent in idle as rules, not only debug suggestions")
@@ -2851,7 +3238,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         results.append(result)
         write_event_outputs(result, out_dir, args.bit_order)
 
-    write_combined_outputs(results, out_dir, args.bit_order)
+    write_combined_outputs(results, out_dir, args.bit_order, args)
     print_summary(results)
     print(f"\nOutput written to: {out_dir.resolve()}")
     return 0
